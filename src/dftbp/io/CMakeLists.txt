@@ -18,6 +18,7 @@ set(sources-fpp
 
 if(WITH_SOCKETS)
   list(APPEND sources-fpp ${curdir}/ipisocket.F90)
+  list(APPEND sources-fpp ${curdir}/mxlsocket.F90)
 endif()
 
 set(ALL-SOURCES-FPP ${ALL-SOURCES-FPP} ${sources-fpp} PARENT_SCOPE)
