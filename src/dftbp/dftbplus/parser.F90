@@ -5805,8 +5805,9 @@ contains
     !> masses to be returned
     real(dp), allocatable, intent(inout) :: masses(:)
 
-    type(fnode), pointer :: child, value1
+    type(fnode), pointer :: child, child2, child3, mxlNode, value1
     type(string) :: buffer, buffer2, modifier
+    character(lc) :: mxlFile
     logical :: ppRangeInvalid, tNeedFieldStrength
     real (dp) :: defPpRange(2)
     logical :: defaultWrite
@@ -5832,6 +5833,51 @@ contains
     call getChildValue(node, "WriteAtomicEnergies", input%tWriteAtomEnergies, .false.)
     call getChildValue(node, "Pump", input%tPump, .false.)
     call getChildValue(node, "FillingsFromFile", input%tFillingsFromFile, .false.)
+
+    call getChild(node, "MaxwellLinkSocket", child=mxlNode, requested=.false.)
+    if (associated(mxlNode)) then
+    #:if WITH_SOCKETS
+      input%tMxlSocket = .true.
+      call getChild(mxlNode, "File", child=child2, requested=.false.)
+      call getChild(mxlNode, "Host", child=child3, requested=.false.)
+      if (associated(child2) .and. associated(child3)) then
+        call detailedError(mxlNode, "Either Host or File, but not both, must be set for&
+            & MaxwellLinkSocket")
+      end if
+
+      if (associated(child2)) then
+        call getChildValue(child2, "", buffer2)
+        mxlFile = unquote(char(buffer2))
+        if (len_trim(mxlFile) == 0) then
+          call detailedError(child2, "MaxwellLinkSocket File must not be empty")
+        end if
+        if (mxlFile(1:1) == "/") then
+          input%mxlHost = trim(mxlFile)
+        else
+          call getChildValue(mxlNode, "Prefix", buffer, "/tmp/socketmxl_")
+          input%mxlHost = trim(unquote(char(buffer))) // trim(mxlFile)
+        end if
+        input%mxlPort = 0
+      else
+        if (associated(child3)) then
+          call getChildValue(child3, "", buffer2)
+          input%mxlHost = unquote(char(buffer2))
+        else
+          input%mxlHost = "localhost"
+        end if
+        call getChildValue(mxlNode, "Port", input%mxlPort, 31415, child=child)
+        if (input%mxlPort <= 0) then
+          call detailedError(child, "Invalid MaxwellLinkSocket port number")
+        end if
+      end if
+
+      call getChildValue(mxlNode, "Verbosity", input%mxlVerbosity, 0)
+      call getChildValue(mxlNode, "MoleculeId", input%mxlMoleculeId, -1)
+      call getChildValue(mxlNode, "ResetDipole", input%mxlResetDipole, .false.)
+    #:else
+      call detailedError(mxlNode, "Program had been compiled without socket support")
+    #:endif
+    end if
 
     if (input%tPump) then
       call getChildValue(node, "PumpProbeFrames", input%tdPPFrames)

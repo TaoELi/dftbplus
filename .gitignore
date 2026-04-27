@@ -15,4 +15,3 @@ __pycache__
 tools/dptools/build
 .nfs*
 _build*
-tmp-files/

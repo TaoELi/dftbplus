@@ -52,6 +52,9 @@ module dftbp_timedep_timeprop
   use dftbp_elecsolvers_elecsolvers, only : TElectronicSolver
   use dftbp_extlibs_tblite, only : TTBLite
   use dftbp_io_message, only : warning
+#:if WITH_SOCKETS
+  use dftbp_io_mxlsocket, only : MxlSocketComm, MxlSocketComm_init, MxlSocketCommInp
+#:endif
   use dftbp_io_taggedoutput, only : tagLabels, TTaggedWriter
   use dftbp_math_blasroutines, only : gemm, her2k
   use dftbp_math_lapackroutines, only : gesv
@@ -82,6 +85,9 @@ module dftbp_timedep_timeprop
   use dftbp_math_matrixops, only : adjointLowerTriangle_BLACS
   use dftbp_math_scalafxext, only : psymmatinv, phermatinv
   use dftbp_timedep_dynamicsrestart, only : writeRestartFileBlacs, readRestartFileBlacs
+#:endif
+#:if WITH_MPI and not WITH_SCALAPACK
+  use dftbp_extlibs_mpifx, only : mpifx_bcast
 #:endif
 #:if WITH_MBD
   use dftbp_dftb_dispmbd, only : TDispMbd
@@ -222,6 +228,24 @@ module dftbp_timedep_timeprop
 
     !> If initial fillings are provided in an external file
     logical :: tFillingsFromFile
+
+    !> If external electric fields are supplied by MaxwellLink over a socket
+    logical :: tMxlSocket = .false.
+
+    !> Host name for MaxwellLink TCP sockets, or path for UNIX sockets
+    character(lc) :: mxlHost = 'localhost'
+
+    !> MaxwellLink TCP port. Values below 1 select UNIX sockets
+    integer :: mxlPort = 31415
+
+    !> MaxwellLink communication verbosity
+    integer :: mxlVerbosity = 0
+
+    !> Optional molecule id expected from MaxwellLink. Negative values disable checking
+    integer :: mxlMoleculeId = -1
+
+    !> Whether to subtract the initial dipole from the values reported to MaxwellLink
+    logical :: mxlResetDipole = .false.
 
   end type TElecDynamicsInp
 
@@ -436,6 +460,24 @@ module dftbp_timedep_timeprop
 
     !> Write atom resolved energies
     logical :: tWriteAtomEnergies = .false.
+
+    !> If external electric fields are supplied by MaxwellLink over a socket
+    logical :: tMxlSocket = .false.
+
+    !> Host name for MaxwellLink TCP sockets, or path for UNIX sockets
+    character(lc) :: mxlHost = 'localhost'
+
+    !> MaxwellLink TCP port. Values below 1 select UNIX sockets
+    integer :: mxlPort = 31415
+
+    !> MaxwellLink communication verbosity
+    integer :: mxlVerbosity = 0
+
+    !> Optional molecule id expected from MaxwellLink. Negative values disable checking
+    integer :: mxlMoleculeId = -1
+
+    !> Whether to subtract the initial dipole from the values reported to MaxwellLink
+    logical :: mxlResetDipole = .false.
 
     !> Whether dynamics outputs are printed or not for Ehrenfest or electron dynamics.
     logical :: tVerboseDyn = .true.
@@ -817,6 +859,19 @@ contains
     this%restartFreq = inp%restartFreq
     this%speciesName = speciesName
     this%tFillingsFromFile = inp%tFillingsFromFile
+    this%tMxlSocket = inp%tMxlSocket
+    this%mxlHost = inp%mxlHost
+    this%mxlPort = inp%mxlPort
+    this%mxlVerbosity = inp%mxlVerbosity
+    this%mxlMoleculeId = inp%mxlMoleculeId
+    this%mxlResetDipole = inp%mxlResetDipole
+    if (this%tMxlSocket) then
+      this%tdFieldThroughAPI = .true.
+      if (tPeriodic) then
+        call warning('MaxwellLinkSocket applies a uniform electric field. Field components in&
+            & periodic directions follow the same limitations as laser fields.')
+      end if
+    end if
     this%tRealHS = tRealHS
     this%kPoint = kPoint
     this%kWeight = kWeight
@@ -873,6 +928,11 @@ contains
       this%tEnvFromFile = (this%envType == envTypes%fromFile)
       this%indExcitedAtom = inp%indExcitedAtom
       this%nExcitedAtom = inp%nExcitedAtom
+    end if
+
+    if (this%tMxlSocket .and. .not. allocated(this%indExcitedAtom)) then
+      this%indExcitedAtom = [(iAtom, iAtom = 1, nAtom)]
+      this%nExcitedAtom = nAtom
     end if
 
     if (this%tKick) then
@@ -1348,6 +1408,17 @@ contains
     type(TTimer) :: loopTime
     integer :: iStep
     real(dp) :: timeElec
+#:if WITH_SOCKETS
+    type(MxlSocketComm) :: mxlSocket
+    type(MxlSocketCommInp) :: mxlInput
+    character(lc) :: mxlExtra
+    logical :: mxlHaveResult, mxlReceivedInit, mxlStop
+    real(dp) :: mxlDipoleCurrent(3), mxlDipoleEnd(3), mxlDipoleInitial(3)
+    real(dp) :: mxlDipoleStart(3)
+    real(dp) :: mxlEnergy, mxlEnergyEnd, mxlEnergyStart, mxlField(3), mxlInitDt
+    integer :: mxlReceivedMoleculeId
+    real(dp) :: mxlSource(3), mxlTime
+#:endif
 
     call env%globalTimer%startTimer(globalTimers%elecDynInit)
 
@@ -1369,24 +1440,167 @@ contains
     write(stdOut, "(A)") 'Starting electronic dynamics...'
     write(stdOut, "(A80)") repeat("-", 80)
 
-    ! Main loop
-    do iStep = 1, this%nSteps
+#:if WITH_SOCKETS
+    if (this%tMxlSocket) then
 
-      call doTdStep(this, boundaryCond, iStep, coord, orb, neighbourList, nNeighbourSK,&
-          & symNeighbourList, nNeighbourCamSym, iSquare, iSparseStart, img2CentCell, skHamCont,&
-          & skOverCont, ints, env, coordAll, q0, referenceN0, spinW, tDualSpinOrbit, xi, thirdOrd,&
-          & dftbU, onSiteElements, refExtPot, solvation, eFieldScaling, hybridXc, repulsive,&
-          & iAtInCentralRegion, tFixEf, Ef, electronicSolver, qDepExtPot, errStatus)
-      @:PROPAGATE_ERROR(errStatus)
+      mxlInput%host = trim(this%mxlHost)
+      mxlInput%port = this%mxlPort
+      mxlInput%verbosity = this%mxlVerbosity
+    #:if WITH_MPI
+      if (env%mpi%tGlobalLead) then
+    #:endif
+      call MxlSocketComm_init(mxlSocket, mxlInput)
+    #:if WITH_MPI
+      end if
+    #:endif
 
-      if (mod(iStep, max(this%nSteps / 10, 1)) == 0) then
-        call loopTime%stop()
-        timeElec  = loopTime%getWallClockTime()
-        write(stdOut, "(A,2x,I6,2(2x,A,F10.6))") 'Step ', iStep, 'elapsed loop time: ',&
-            & timeElec, 'average time per loop ', timeElec / (iStep + 1)
+      mxlHaveResult = .false.
+      mxlDipoleInitial(:) = 0.0_dp
+      if (this%mxlResetDipole) then
+        call getMxlDipole(this, mxlDipoleInitial)
       end if
 
-    end do
+      do iStep = 1, this%nSteps
+
+      #:if WITH_MPI
+        if (env%mpi%tGlobalLead) then
+      #:endif
+        call mxlSocket%receiveField(mxlHaveResult, mxlField, mxlStop, mxlReceivedInit)
+        if (mxlReceivedInit) then
+          mxlInitDt = mxlSocket%getInitDt()
+          mxlReceivedMoleculeId = mxlSocket%getMoleculeId()
+        else
+          mxlInitDt = -1.0_dp
+          mxlReceivedMoleculeId = -1
+        end if
+      #:if WITH_MPI
+        else
+          mxlField(:) = 0.0_dp
+          mxlStop = .false.
+          mxlReceivedInit = .false.
+          mxlInitDt = -1.0_dp
+          mxlReceivedMoleculeId = -1
+        end if
+        call mpifx_bcast(env%mpi%globalComm, mxlField)
+        call mpifx_bcast(env%mpi%globalComm, mxlStop)
+        call mpifx_bcast(env%mpi%globalComm, mxlReceivedInit)
+        call mpifx_bcast(env%mpi%globalComm, mxlInitDt)
+        call mpifx_bcast(env%mpi%globalComm, mxlReceivedMoleculeId)
+      #:endif
+        if (mxlReceivedInit) then
+          if (mxlInitDt > 0.0_dp .and.&
+              & abs(mxlInitDt - this%dt) > 1.0e-10_dp * max(1.0_dp, abs(this%dt))) then
+            @:RAISE_ERROR(errStatus, -1, "MaxwellLink INIT dt_au does not match&
+                & ElectronDynamics TimeStep")
+          end if
+          if (this%mxlMoleculeId >= 0 .and.&
+              & mxlReceivedMoleculeId /= this%mxlMoleculeId) then
+            @:RAISE_ERROR(errStatus, -1, "MaxwellLink INIT molecule id does not match&
+                & ElectronDynamics MaxwellLinkSocket MoleculeId")
+          end if
+        end if
+        if (mxlStop) then
+          exit
+        end if
+
+        this%presentField(:) = eFieldScaling%scaledExtEField(mxlField)
+        this%tdFieldIsSet = .true.
+
+        call getMxlDipole(this, mxlDipoleStart)
+        mxlDipoleStart(:) = mxlDipoleStart(:) - mxlDipoleInitial(:)
+
+        call updateH(this, this%H1, ints, this%ham0, this%speciesAll, this%qq, q0, coord,&
+            & orb, this%potential, neighbourList, nNeighbourSK, iSquare, iSparseStart,&
+            & img2CentCell, iStep, this%chargePerShell, spinW, env, tDualSpinOrbit, xi,&
+            & thirdOrd, this%qBlock, dftbU, onSiteElements, refExtPot, this%deltaRho,&
+            & this%HSqrCplxCam, this%Ssqr, solvation, hybridXc, this%dispersion, this%rho,&
+            & errStatus)
+        @:PROPAGATE_ERROR(errStatus)
+
+        call doTdStep(this, boundaryCond, iStep, coord, orb, neighbourList, nNeighbourSK,&
+            & symNeighbourList, nNeighbourCamSym, iSquare, iSparseStart, img2CentCell, skHamCont,&
+            & skOverCont, ints, env, coordAll, q0, referenceN0, spinW, tDualSpinOrbit, xi,&
+            & thirdOrd, dftbU, onSiteElements, refExtPot, solvation, eFieldScaling, hybridXc,&
+            & repulsive, iAtInCentralRegion, tFixEf, Ef, electronicSolver, qDepExtPot, errStatus)
+        @:PROPAGATE_ERROR(errStatus)
+
+        mxlEnergyStart = this%energy%Etotal
+        call getTDEnergy(this, env, this%energy, this%rhoPrim, this%rho, neighbourList,&
+            & nNeighbourSK, orb, iSquare, iSparseStart, img2CentCell, this%ham0, this%qq, q0,&
+            & this%potential, this%chargePerShell, this%energyKin, tDualSpinOrbit, thirdOrd,&
+            & solvation, hybridXc, qDepExtPot, this%qBlock, dftbU, xi, iAtInCentralRegion,&
+            & tFixEf, Ef, onSiteElements, errStatus)
+        @:PROPAGATE_ERROR(errStatus)
+        mxlEnergyEnd = this%energy%Etotal
+
+        call getMxlDipole(this, mxlDipoleEnd)
+        mxlDipoleEnd(:) = mxlDipoleEnd(:) - mxlDipoleInitial(:)
+        mxlTime = this%time
+        mxlEnergy = 0.5_dp * (mxlEnergyStart + mxlEnergyEnd)
+        mxlDipoleCurrent(:) = 0.5_dp * (mxlDipoleStart(:) + mxlDipoleEnd(:))
+        mxlSource(:) = (mxlDipoleEnd(:) - mxlDipoleStart(:)) / this%dt
+
+        call buildMxlExtraJson(mxlTime, mxlEnergy, this%energyKin, mxlDipoleCurrent,&
+            & mxlDipoleCurrent, mxlExtra)
+
+        mxlHaveResult = .true.
+      #:if WITH_MPI
+        if (env%mpi%tGlobalLead) then
+      #:endif
+        call mxlSocket%sendSource(mxlEnergy, mxlSource, trim(mxlExtra), mxlStop)
+      #:if WITH_MPI
+        else
+          mxlStop = .false.
+        end if
+        call mpifx_bcast(env%mpi%globalComm, mxlStop)
+      #:endif
+        mxlHaveResult = .false.
+        this%tdFieldIsSet = .false.
+        if (mxlStop) then
+          exit
+        end if
+
+        if (mod(iStep, max(this%nSteps / 10, 1)) == 0) then
+          call loopTime%stop()
+          timeElec  = loopTime%getWallClockTime()
+          write(stdOut, "(A,2x,I6,2(2x,A,F10.6))") 'Step ', iStep, 'elapsed loop time: ',&
+              & timeElec, 'average time per loop ', timeElec / (iStep + 1)
+        end if
+
+      end do
+
+    #:if WITH_MPI
+      if (env%mpi%tGlobalLead) then
+    #:endif
+      call mxlSocket%shutdown()
+    #:if WITH_MPI
+      end if
+    #:endif
+
+    else
+#:endif
+
+      ! Main loop
+      do iStep = 1, this%nSteps
+
+        call doTdStep(this, boundaryCond, iStep, coord, orb, neighbourList, nNeighbourSK,&
+            & symNeighbourList, nNeighbourCamSym, iSquare, iSparseStart, img2CentCell, skHamCont,&
+            & skOverCont, ints, env, coordAll, q0, referenceN0, spinW, tDualSpinOrbit, xi,&
+            & thirdOrd, dftbU, onSiteElements, refExtPot, solvation, eFieldScaling, hybridXc,&
+            & repulsive, iAtInCentralRegion, tFixEf, Ef, electronicSolver, qDepExtPot, errStatus)
+        @:PROPAGATE_ERROR(errStatus)
+
+        if (mod(iStep, max(this%nSteps / 10, 1)) == 0) then
+          call loopTime%stop()
+          timeElec  = loopTime%getWallClockTime()
+          write(stdOut, "(A,2x,I6,2(2x,A,F10.6))") 'Step ', iStep, 'elapsed loop time: ',&
+              & timeElec, 'average time per loop ', timeElec / (iStep + 1)
+        end if
+
+      end do
+#:if WITH_SOCKETS
+    end if
+#:endif
 
     write(stdOut, "(A)") 'Dynamics finished OK!'
     call env%globalTimer%stopTimer(globalTimers%elecDynLoop)
@@ -1563,7 +1777,7 @@ contains
     end if
 
     ! Add time dependent field if necessary
-    if (this%tLaser) then
+    if (this%tLaser .or. this%tMxlSocket) then
       call setPresentField(this, iStep, errStatus)
       @:PROPAGATE_ERROR(errStatus)
       do iAtom = 1, this%nExcitedAtom
@@ -2046,7 +2260,13 @@ contains
       dipole(:,:) = dipole - sum(multipole%dipoleAtom(:, :, :), dim=2)
     end if
 
-    dipole(:,1) = eFieldScaling%scaledSoluteDipole(dipole(:,1))
+    if (this%nSpin == 2) then
+      do iSpin = 1, this%nSpin
+        dipole(:,iSpin) = eFieldScaling%scaledSoluteDipole(dipole(:,iSpin))
+      end do
+    else
+      dipole(:,1) = eFieldScaling%scaledSoluteDipole(dipole(:,1))
+    end if
 
     if (allocated(qBlock)) then
       if (.not. this%tRealHS) then
@@ -2237,9 +2457,10 @@ contains
 
     TS = 0.0_dp
     call calcEnergies(env, this%sccCalc, this%tblite, qq, q0, chargePerShell, this%multipole,&
-        & mdftb, this%speciesAll, this%tLaser, .false., dftbU, tDualSpinOrbit, rhoPrim,&
-        & ham0, orb, neighbourList, nNeighbourSK, img2CentCell, iSparseStart, 0.0_dp, 0.0_dp, TS,&
-        & potential, energy, thirdOrd, solvation, hybridXc, reks, qDepExtPot, qBlock,&
+        & mdftb, this%speciesAll, this%tLaser .or. this%tMxlSocket, .false., dftbU,&
+        & tDualSpinOrbit, rhoPrim, ham0, orb, neighbourList, nNeighbourSK, img2CentCell,&
+        & iSparseStart, 0.0_dp, 0.0_dp, TS, potential, energy, thirdOrd, solvation, hybridXc,&
+        & reks, qDepExtPot, qBlock,&
         & qiBlock, xi, iAtInCentralRegion, tFixEf, Ef, .true., onSiteElements, errStatus)
     @:PROPAGATE_ERROR(errStatus)
     call sumEnergies(energy)
@@ -3993,7 +4214,7 @@ contains
     #:endif
     end if
 
-    if (this%tLaser) then
+    if (this%tLaser .or. this%tMxlSocket) then
       call setPresentField(this, iStep, errStatus)
       @:PROPAGATE_ERROR(errStatus)
       do iDir = 1, 3
@@ -4211,6 +4432,62 @@ contains
     end if
 
   end subroutine getPositionDependentEnergy
+
+
+  !> Return the charge dipole seen by the MaxwellLink EM coupling.
+  subroutine getMxlDipole(this, dipole)
+
+    !> ElecDynamics instance.
+    type(TElecDynamics), intent(in) :: this
+
+    !> Charge dipole in atomic units.
+    real(dp), intent(out) :: dipole(3)
+
+    if (this%nSpin == 2) then
+      dipole(:) = this%dipole(:, 1) + this%dipole(:, 2)
+    else
+      dipole(:) = this%dipole(:, 1)
+    end if
+
+  end subroutine getMxlDipole
+
+
+  !> Build MaxwellLink JSON metadata returned with source data.
+  subroutine buildMxlExtraJson(time, energy, energyKin, dipole, dipoleMiddle, extraJson)
+
+    !> Elapsed simulation time in atomic units.
+    real(dp), intent(in) :: time
+
+    !> Total energy in Hartree.
+    real(dp), intent(in) :: energy
+
+    !> Nuclear kinetic energy in Hartree.
+    real(dp), intent(in) :: energyKin
+
+    !> Dipole reported to MaxwellLink.
+    real(dp), intent(in) :: dipole(3)
+
+    !> Midpoint dipole reported under the MaxwellLink midpoint-key convention.
+    real(dp), intent(in) :: dipoleMiddle(3)
+
+    !> JSON metadata.
+    character(*), intent(out) :: extraJson
+
+    write(extraJson, '(A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,&
+        & A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A)')&
+        & '{"time_au":', time,&
+        & ',"mux_au":', dipole(1),&
+        & ',"muy_au":', dipole(2),&
+        & ',"muz_au":', dipole(3),&
+        & ',"mux_m_au":', dipoleMiddle(1),&
+        & ',"muy_m_au":', dipoleMiddle(2),&
+        & ',"muz_m_au":', dipoleMiddle(3),&
+        & ',"energy_au":', energy,&
+        & ',"energy_kin_au":', energyKin,&
+        & ',"energy_pot_au":', energy - energyKin,&
+        & '}'
+
+  end subroutine buildMxlExtraJson
 
 
   !> Calculates bond populations and bond energies if requested
