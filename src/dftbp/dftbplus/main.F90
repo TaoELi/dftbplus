@@ -10,7 +10,7 @@
 
 !> The main routines for DFTB+
 module dftbp_dftbplus_main
-  use dftbp_common_accuracy, only : dp, elecTolMax, tolSameDist
+  use dftbp_common_accuracy, only : dp, elecTolMax, lc, tolSameDist
   use dftbp_common_constants, only : pi
   use dftbp_common_environment, only : globalTimers, TEnvironment
   use dftbp_common_file, only : closeFile, openFile, TFileDescr
@@ -99,7 +99,7 @@ module dftbp_dftbplus_main
   use dftbp_math_matrixops, only : adjointLowerTriangle
   use dftbp_math_simplealgebra, only : derivDeterminant33, determinant33, invert33, removeTrace
   use dftbp_md_mdcommon, only : evalKE, evalKT, TMdCommon
-  use dftbp_md_mdintegrator, only : next, rescale, TMdIntegrator
+  use dftbp_md_mdintegrator, only : next, rescale, state, TMdIntegrator
   use dftbp_md_tempprofile, only : TTempProfile
   use dftbp_md_xlbomd, only : TXLBOMD
   use dftbp_mixer_mixer, only : TMixerCmplx, TMixerReal
@@ -203,6 +203,14 @@ contains
 
     type(TStatus) :: errStatus
     real(dp), pointer :: pDynMatrix(:,:), pDipDerivMatrix(:,:), pPolDerivMatrix(:,:,:)
+  #:if WITH_SOCKETS
+    real(dp) :: mxlField(3), mxlSource(3), mxlSoluteDipole(3), mxlDipole(3)
+    real(dp) :: mxlSoluteDipoleNext(3), mxlDipoleMiddle(3)
+    real(dp) :: mxlEnergyKin, mxlEnergyMerminKin
+    real(dp), allocatable :: mxlVeloHalf(:,:)
+    character(4 * lc) :: mxlExtraJson
+    logical :: tMxlStop
+  #:endif
 
     call initGeoOptParameters(this%tCoordOpt, this%nGeoSteps, tGeomEnd, tCoordStep, tStopDriver,&
         & iGeoStep, iLatGeoStep)
@@ -221,6 +229,17 @@ contains
       if (.not. this%tRestartNoSC) then
         call printGeoStepInfo(this%tCoordOpt, this%tLatOpt, iLatGeoStep, iGeoStep)
       end if
+
+    #:if WITH_SOCKETS
+      if (this%tMxlBomd) then
+        call this%mxlBomd%receiveField(env, this%deltaT, mxlField, tStopDriver)
+        if (tStopDriver) then
+          exit geoOpt
+        end if
+        mxlField(:) = this%eFieldScaling%scaledExtEField(mxlField)
+        call this%mxlBomd%setField(mxlField)
+      end if
+    #:endif
 
       ! DFTB Determinant Loop
       ! Will pass though loop once, unless specified in input to perform multiple determinants
@@ -255,6 +274,18 @@ contains
       call this%deltaDftb%postProcessDets(this%dftbEnergy, this%qOutput, this%qDets,&
           & this%qBlockOut, this%qBlockDets, this%dipoleMoment, this%totalStress,&
           & this%tripletStress, this%mixedStress, this%derivs, this%tripletderivs, this%mixedderivs)
+
+    #:if WITH_SOCKETS
+      if (this%tMxlBomd) then
+        if (this%mxlBomd%needsBornUpdate(iGeoStep)) then
+          call updateMxlBomdBornCharges(this, env, errStatus)
+          if (errStatus%hasError()) then
+            call error(errStatus%message)
+          end if
+        end if
+        call this%mxlBomd%addFieldDerivs(this%qOutput, this%q0, this%derivs)
+      end if
+    #:endif
 
       if (this%tWriteDetailedOut .and. this%deltaDftb%nDeterminant() > 1) then
         call writeDetailedOut2Dets(this%fdDetailedOut, userOut, tAppendDetailedOut,&
@@ -335,6 +366,15 @@ contains
         end if
       end if
 
+    #:if WITH_SOCKETS
+      if (this%tMxlBomd) then
+        call this%mxlBomd%getDipole(this%qOutput, this%q0, this%coord0,&
+            & this%iAtInCentralRegion, this%dipoleMoment(:, this%deltaDftb%iFinal),&
+            & mxlSoluteDipole)
+        mxlSoluteDipole(:) = this%eFieldScaling%scaledSoluteDipole(mxlSoluteDipole)
+      end if
+    #:endif
+
       if (this%tForces) then
         call getNextGeometry(this, env, iGeoStep, tWriteRestart, constrLatDerivs, tCoordStep,&
             & tGeomEnd, tStopDriver, iLatGeoStep, tempIon, tExitGeoOpt)
@@ -342,6 +382,36 @@ contains
           exit geoOpt
         end if
       end if
+
+    #:if WITH_SOCKETS
+      if (this%tMxlBomd) then
+        mxlEnergyMerminKin = this%dftbEnergy(this%deltaDftb%iFinal)%EMerminKin
+        mxlEnergyKin = this%dftbEnergy(this%deltaDftb%iFinal)%Ekin
+        if (this%mxlBomd%usesFiniteDifferenceSource()) then
+          call getMxlBomdEndpointDipole(this, env, iGeoStep + 1, iLatGeoStep,&
+              & mxlSoluteDipoleNext, errStatus)
+          if (errStatus%hasError()) then
+            call error(errStatus%message)
+          end if
+          mxlSoluteDipoleNext(:) = this%eFieldScaling%scaledSoluteDipole(mxlSoluteDipoleNext)
+          call this%mxlBomd%getFiniteDifferenceSource(this%deltaT, mxlSoluteDipole,&
+              & mxlSoluteDipoleNext, mxlSource)
+        else
+          allocate(mxlVeloHalf(3, this%nMovedAtom))
+          call state(this%pMdIntegrator, velocities=mxlVeloHalf)
+          call this%mxlBomd%getSource(this%indMovedAtom, mxlVeloHalf, mxlSource)
+          deallocate(mxlVeloHalf)
+          mxlSource(:) = this%eFieldScaling%scaledSoluteDipole(mxlSource)
+        end if
+        call this%mxlBomd%getDipoles(this%deltaT,&
+            & mxlSoluteDipole, mxlSource, mxlDipole, mxlDipoleMiddle)
+        call this%mxlBomd%buildExtraJson((real(iGeoStep, dp) + 0.5_dp) * this%deltaT,&
+            & mxlEnergyMerminKin, mxlEnergyKin, mxlDipole, mxlDipoleMiddle, mxlExtraJson)
+        call this%mxlBomd%sendSource(env, mxlEnergyMerminKin, mxlSource,&
+            & trim(mxlExtraJson), tMxlStop)
+        tStopDriver = tStopDriver .or. tMxlStop
+      end if
+    #:endif
 
       if (this%tWriteDetailedOut .and. this%tMd) then
         call writeDetailedOut6(this%fdDetailedOut%unit, this%dftbEnergy(this%deltaDftb%iFinal),&
@@ -367,6 +437,9 @@ contains
   #:if WITH_SOCKETS
     if (this%tSocket .and. env%tGlobalLead) then
       call this%socket%shutdown()
+    end if
+    if (this%tMxlBomd) then
+      call this%mxlBomd%shutdown(env)
     end if
   #:endif
 
@@ -1103,7 +1176,7 @@ contains
 
   !> Process current geometry
   subroutine processGeometry(this, env, iGeoStep, iLatGeoStep, tWriteRestart, tStopScc,&
-      & tExitGeoOpt, errStatus)
+      & tExitGeoOpt, errStatus, tQuiet)
 
     !> Global variables
     type(TDftbPlusMain), intent(inout) :: this
@@ -1128,6 +1201,9 @@ contains
 
     !> Status of operation
     type(TStatus), intent(out) :: errStatus
+
+    !> Suppress routine-owned output for internal probe evaluations.
+    logical, intent(in), optional :: tQuiet
 
     !! Self-consistency error in the last iterations
     real(dp) :: sccErrorQ
@@ -1155,9 +1231,14 @@ contains
 
     integer :: iKS, iConstrIter, nConstrIter
     logical :: isFirstDet
+    logical :: tDoOutput
 
     if (this%tDipole) allocate(dipoleTmp(3))
     isFirstDet = this%deltaDftb%iDeterminant == 1
+    tDoOutput = .true.
+    if (present(tQuiet)) then
+      tDoOutput = .not. tQuiet
+    end if
 
     call env%globalTimer%startTimer(globalTimers%preSccInit)
 
@@ -1166,7 +1247,7 @@ contains
     call this%electronicSolver%reset()
     tExitGeoOpt = .false.
 
-    if (this%tMD .and. tWriteRestart .and. isFirstDet) then
+    if (tDoOutput .and. this%tMD .and. tWriteRestart .and. isFirstDet) then
       if (iGeoStep == 0) then
         call openOutputFile(mdOut, .false., this%fdMd)
       end if
@@ -1391,12 +1472,16 @@ contains
         end if
 
         call getSccInfo(iSccIter, this%dftbEnergy(1)%Eavg, Eold, diffElec)
-        call printReksSccInfo(iSccIter, this%dftbEnergy(1)%Eavg, diffElec, sccErrorQ,&
-            & this%reks)
+        if (tDoOutput) then
+          call printReksSccInfo(iSccIter, this%dftbEnergy(1)%Eavg, diffElec, sccErrorQ,&
+              & this%reks)
+        end if
 
         if (tConverged .or. tStopScc) then
 
-          call printReksSAInfo(this%reks, this%dftbEnergy(1)%Eavg)
+          if (tDoOutput) then
+            call printReksSAInfo(this%reks, this%dftbEnergy(1)%Eavg)
+          end if
 
           call getStateInteraction(env, this%denseDesc, this%neighbourList, this%nNeighbourSK,&
               & this%iSparseStart, this%img2CentCell, this%coord, this%iAtInCentralRegion,&
@@ -1410,7 +1495,8 @@ contains
               & this%densityMatrix, errStatus)
           @:PROPAGATE_ERROR(errStatus)
 
-          if (this%tWriteDetailedOut .and. this%deltaDftb%nDeterminant() == 1) then
+          if (tDoOutput .and. this%tWriteDetailedOut&
+              & .and. this%deltaDftb%nDeterminant() == 1) then
             ! In this routine the correct Etotal is evaluated.
             ! If TargetStateL > 0, certain microstate
             ! is optimized. If not, SSR state is optimized.
@@ -1425,7 +1511,7 @@ contains
                 & allocated(this%thirdOrd), this%isHybridXc, qNetAtom=this%qNetAtom,&
                 & isMdftb=allocated(this%quadrupoleMoment))
           end if
-          if (this%tWriteBandDat) then
+          if (tDoOutput .and. this%tWriteBandDat) then
             if (this%tMD .and. iGeoStep /= 0 .and. tWriteRestart) then
               call writeBandOut(bandOut, this%eigen, this%filling, this%kWeight,&
                   & isFileAppended=this%mdOutput%bandStructure)
@@ -1493,7 +1579,7 @@ contains
               & this%dangerousChanges, errStatus)
           if (errStatus%hasError()) call error(errStatus%message)
 
-          if (this%tWriteBandDat) then
+          if (tDoOutput .and. this%tWriteBandDat) then
             if (this%deltaDftb%nDeterminant() == 1) then
               if (this%tMD .and. iGeoStep /= 0 .and. tWriteRestart) then
                 ! the iGeoStep test is so that the initial step has a new file
@@ -1572,7 +1658,9 @@ contains
         end if
         call sumEnergies(this%dftbEnergy(this%deltaDftb%iDeterminant))
 
-        call sccLoopWriting(this, iGeoStep, iLatGeoStep, iSccIter, diffElec, sccErrorQ)
+        if (tDoOutput) then
+          call sccLoopWriting(this, iGeoStep, iLatGeoStep, iSccIter, diffElec, sccErrorQ)
+        end if
 
         if (tConverged .or. tStopScc) exit lpSCC
 
@@ -1613,7 +1701,7 @@ contains
       call sumEnergies(this%dftbEnergy(this%deltaDftb%iDeterminant))
     end if
 
-    if (this%tWriteDetailedOut .and. this%deltaDftb%nDeterminant() == 1) then
+    if (tDoOutput .and. this%tWriteDetailedOut .and. this%deltaDftb%nDeterminant() == 1) then
       call closeFile(this%fdDetailedOut)
       call openOutputFile(userOut, tAppendDetailedOut, this%fdDetailedOut)
       if (allocated(this%reks)) then
@@ -1673,14 +1761,14 @@ contains
     end if
 
     call env%globalTimer%startTimer(globalTimers%eigvecWriting)
-    if (this%tPrintEigVecs) then
+    if (tDoOutput .and. this%tPrintEigVecs) then
       call writeEigenvectors(env, this%runId, this%neighbourList, this%nNeighbourSk, this%cellVec,&
           & this%iCellVec, this%denseDesc, this%iSparseStart, this%img2CentCell, this%species,&
           & this%speciesName, this%orb, this%kPoint, this%ints%overlap, this%parallelKS,&
           & this%tPrintEigvecsTxt, this%eigvecsReal, this%SSqrReal, this%eigvecsCplx, this%SSqrCplx)
     end if
 
-    if (this%tProjEigenvecs) then
+    if (tDoOutput .and. this%tProjEigenvecs) then
       call writeProjectedEigenvectors(env, this%regionLabels, this%eigen, this%neighbourList,&
           & this%nNeighbourSk, this%cellVec, this%iCellVec, this%denseDesc, this%iSparseStart,&
           & this%img2CentCell, this%orb, this%ints%overlap, this%kPoint, this%kWeight,&
@@ -1753,7 +1841,7 @@ contains
     end if
 
     ! MD geometry files are written only later, once velocities for the current geometry are known
-    if ((this%isGeoOpt .or. allocated(this%geoOpt)) .and. tWriteRestart) then
+    if (tDoOutput .and. (this%isGeoOpt .or. allocated(this%geoOpt)) .and. tWriteRestart) then
       if (.not. (this%deltaDftb%isSpinPurify .and.&
           & this%deltaDftb%iDeterminant == determinants%triplet)) then
         call writeCurrentGeometry(this%geoOutFile, this%pCoord0Out, this%tLatOpt, this%tMd,&
@@ -1763,7 +1851,7 @@ contains
             & this%derivs)
       endif
     end if
-    if (len(trim(this%extendedGeomFile)) > 0) then
+    if (tDoOutput .and. len(trim(this%extendedGeomFile)) > 0) then
       call writeExtendedGeometry(trim(this%extendedGeomFile), this%tLatOpt, this%tMd,&
           & this%tAppendGeo.and.iGeoStep>0, this%speciesName, iGeoStep, iLatGeoStep, this%coord,&
           & this%species)
@@ -1855,7 +1943,7 @@ contains
 
     end if
 
-    if (this%tWriteDetailedOut .and. this%deltaDftb%nDeterminant() == 1) then
+    if (tDoOutput .and. this%tWriteDetailedOut .and. this%deltaDftb%nDeterminant() == 1) then
       call writeDetailedOut4(this%fdDetailedOut%unit, this%tSccCalc,&
           & allocated(this%elecConstraint), tConverged, constrConverged, this%isXlbomd,&
           & this%isLinResp, this%isGeoOpt .or. allocated(this%geoOpt), this%tMD, this%tPrintForces,&
@@ -1864,7 +1952,7 @@ contains
           & this%cellVol, this%intPressure, this%geoOutFile, this%iAtInCentralRegion)
     end if
 
-    if (this%tSccCalc .and. allocated(this%electrostatPot)&
+    if (tDoOutput .and. this%tSccCalc .and. allocated(this%electrostatPot)&
         & .and. (.not. (this%isGeoOpt .or. allocated(this%geoOpt) .or. this%tMD)&
         & .or. needsRestartWriting(this%isGeoOpt .or. allocated(this%geoOpt), this%tMd,&
         & iGeoStep, this%nGeoSteps, this%restartFreq))) then
@@ -8164,6 +8252,149 @@ contains
       call socket%send(energy%ETotal - sum(energy%TS), -derivs, totalStress * cellVol)
     end if
   end subroutine sendEnergyAndForces
+
+
+  !> Evaluate the coupling dipole at the current endpoint geometry without changing MD output state.
+  subroutine getMxlBomdEndpointDipole(this, env, iGeoStep, iLatGeoStep, dipole, errStatus)
+
+    !> Global variables.
+    type(TDftbPlusMain), intent(inout) :: this
+
+    !> Environment settings.
+    type(TEnvironment), intent(inout) :: env
+
+    !> Geometry step label for the endpoint probe.
+    integer, intent(in) :: iGeoStep
+
+    !> Current lattice step.
+    integer, intent(in) :: iLatGeoStep
+
+    !> Coupling dipole at the endpoint geometry.
+    real(dp), intent(out) :: dipole(3)
+
+    !> Error status.
+    type(TStatus), intent(out) :: errStatus
+
+    type(TEnergies), allocatable :: savedDftbEnergy(:)
+    real(dp), allocatable :: savedDipoleMoment(:,:)
+    character(lc) :: savedExtendedGeomFile
+    logical :: savedTForces, savedTStress, savedTPrintForces, savedTWriteCharges
+    logical :: savedTWriteDetailedOut, savedTWriteBandDat, savedTPrintEigVecs
+    logical :: savedTProjEigenvecs, savedTWriteAutotest, savedTWriteResultsTag
+    logical :: savedTWriteHS, savedTWriteRealHS
+    logical :: tEndpointExit, tEndpointStopScc
+
+    dipole(:) = 0.0_dp
+
+    allocate(savedDftbEnergy(size(this%dftbEnergy)))
+    savedDftbEnergy(:) = this%dftbEnergy(:)
+    if (allocated(this%dipoleMoment)) then
+      allocate(savedDipoleMoment(size(this%dipoleMoment, dim=1),&
+          & size(this%dipoleMoment, dim=2)))
+      savedDipoleMoment(:,:) = this%dipoleMoment(:,:)
+    end if
+
+    savedTForces = this%tForces
+    savedTStress = this%tStress
+    savedTPrintForces = this%tPrintForces
+    savedTWriteCharges = this%tWriteCharges
+    savedTWriteDetailedOut = this%tWriteDetailedOut
+    savedTWriteBandDat = this%tWriteBandDat
+    savedTPrintEigVecs = this%tPrintEigVecs
+    savedTProjEigenvecs = this%tProjEigenvecs
+    savedTWriteAutotest = this%tWriteAutotest
+    savedTWriteResultsTag = this%tWriteResultsTag
+    savedTWriteHS = this%tWriteHS
+    savedTWriteRealHS = this%tWriteRealHS
+    savedExtendedGeomFile = this%extendedGeomFile
+
+    this%tForces = .false.
+    this%tStress = .false.
+    this%tPrintForces = .false.
+    this%tWriteCharges = .false.
+    this%tWriteDetailedOut = .false.
+    this%tWriteBandDat = .false.
+    this%tPrintEigVecs = .false.
+    this%tProjEigenvecs = .false.
+    this%tWriteAutotest = .false.
+    this%tWriteResultsTag = .false.
+    this%tWriteHS = .false.
+    this%tWriteRealHS = .false.
+    this%extendedGeomFile = ''
+
+    call processGeometry(this, env, iGeoStep, iLatGeoStep, .false., tEndpointStopScc,&
+        & tEndpointExit, errStatus, tQuiet=.true.)
+    if (.not. errStatus%hasError()) then
+      call this%mxlBomd%getDipole(this%qOutput, this%q0, this%coord0,&
+          & this%iAtInCentralRegion, this%dipoleMoment(:, this%deltaDftb%iFinal), dipole)
+    end if
+
+    this%dftbEnergy(:) = savedDftbEnergy(:)
+    if (allocated(savedDipoleMoment)) then
+      this%dipoleMoment(:,:) = savedDipoleMoment(:,:)
+    end if
+    this%tForces = savedTForces
+    this%tStress = savedTStress
+    this%tPrintForces = savedTPrintForces
+    this%tWriteCharges = savedTWriteCharges
+    this%tWriteDetailedOut = savedTWriteDetailedOut
+    this%tWriteBandDat = savedTWriteBandDat
+    this%tPrintEigVecs = savedTPrintEigVecs
+    this%tProjEigenvecs = savedTProjEigenvecs
+    this%tWriteAutotest = savedTWriteAutotest
+    this%tWriteResultsTag = savedTWriteResultsTag
+    this%tWriteHS = savedTWriteHS
+    this%tWriteRealHS = savedTWriteRealHS
+    this%extendedGeomFile = savedExtendedGeomFile
+
+    if (errStatus%hasError()) then
+      return
+    end if
+    if (tEndpointStopScc) then
+      call error("MaxwellLink BOMD endpoint dipole evaluation stopped during SCC")
+    end if
+    if (tEndpointExit) then
+      call error("MaxwellLink BOMD endpoint dipole evaluation exited unexpectedly")
+    end if
+
+  end subroutine getMxlBomdEndpointDipole
+
+
+  !> Recompute Born effective charges for MaxwellLink-coupled BOMD.
+  subroutine updateMxlBomdBornCharges(this, env, errStatus)
+
+    !> Global variables.
+    type(TDftbPlusMain), intent(inout) :: this
+
+    !> Environment settings.
+    type(TEnvironment), intent(inout) :: env
+
+    !> Error status.
+    type(TStatus), intent(out) :: errStatus
+
+    real(dp), allocatable :: bornCharges(:,:,:)
+    integer :: maxPerturbIter
+    real(dp) :: perturbSccTol
+
+    call this%mxlBomd%getPerturbSettings(maxPerturbIter, perturbSccTol)
+    call this%response%dxAtom(env, this%parallelKS, this%filling, this%eigen, this%eigVecsReal,&
+        & this%eigvecsCplx, this%rhoPrim, this%potential, this%qOutput, this%q0,&
+        & this%ints%hamiltonian, this%ints%overlap, this%skHamCont, this%skOverCont,&
+        & this%mxlBomdNonSccDeriv, this%orb, this%nAtom, this%species, this%speciesName,&
+        & this%neighbourList, this%nNeighbourSK, this%denseDesc, this%iSparseStart,&
+        & this%img2CentCell, this%coord, this%scc, maxPerturbIter, perturbSccTol,&
+        & this%nMixElements, this%nIneqOrb, this%iEqOrbitals, this%tempElec, this%Ef,&
+        & this%tFixEf, this%spinW, this%thirdOrd, this%dftbU, this%iEqBlockDftbu,&
+        & this%onSiteElements, this%iEqBlockOnSite, this%hybridXc, this%nNeighbourCam,&
+        & this%chrgMixerReal, .false., this%taggedWriter, .false., autotestTag, .false.,&
+        & resultsTag, .false., this%fdDetailedOut%unit, this%kPoint, this%kWeight,&
+        & this%iCellVec, this%cellVec, this%tPeriodic, this%tHelical, this%tMulliken, errStatus,&
+        & bornChargesOut=bornCharges, tWriteResponseOutput=.false.)
+    @:PROPAGATE_ERROR(errStatus)
+
+    call this%mxlBomd%updateBornChargesFromResponse(bornCharges)
+
+  end subroutine updateMxlBomdBornCharges
 
 #:endif
 

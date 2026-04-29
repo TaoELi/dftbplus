@@ -13,6 +13,7 @@ module dftbp_dftb_nonscc
   use dftbp_common_accuracy, only : dp
   use dftbp_common_environment, only : TEnvironment
   use dftbp_common_schedule, only : assembleChunks, distributeRangeInChunks
+  use dftbp_derivs_bornanalytic, only : getFirstDerivAnalytic
   use dftbp_dftb_sk, only : rotateH0
   use dftbp_dftb_slakocont, only : getMIntegrals, getSKIntegrals, TSlakoCont
   use dftbp_io_message, only : error
@@ -30,6 +31,8 @@ module dftbp_dftb_nonscc
     integer :: finiteDiff = 1
     !> Richardson extrapolation to the limit
     integer :: richardson = 2
+    !> Analytic two-centre Slater-Koster derivatives
+    integer :: analytic = 3
   end type TDiffTypesEnum
 
   !> Actual values for diffTypes.
@@ -189,13 +192,13 @@ contains
     !> Initialised instance on exit.
     type(TNonSccDiff), intent(out) :: this
 
-    !> Type of the differentiator: diffTypes%finiteDiff or diffTypes%richardson
+    !> Type of the differentiator: finite-difference, Richardson or analytic SK derivatives.
     integer, intent(in) :: diffType
 
     !> Displacement for finite difference differentiation.
     real(dp), intent(in), optional :: deltaXDiff
 
-    if (all([diffTypes%finiteDiff, diffTypes%richardson] /= diffType)) then
+    if (all([diffTypes%finiteDiff, diffTypes%richardson, diffTypes%analytic] /= diffType)) then
       call error("Invalid differentiator type in NonSccDiff_init")
     end if
     this%diffType = diffType
@@ -239,6 +242,8 @@ contains
           & this%deltaXDiff)
     case (diffTypes%richardson)
       call getFirstDerivRichardson(deriv, skCont, coords, species, atomI, atomJ, orb)
+    case (diffTypes%analytic)
+      call getFirstDerivAnalytic(deriv, skCont, coords, species, atomI, atomJ, orb)
     end select
 
   end subroutine getFirstDerivBlock
@@ -310,6 +315,11 @@ contains
     case (diffTypes%richardson)
 
       call error("Finite difference method not currently implemented for full derivatives")
+
+    case (diffTypes%analytic)
+
+      call getFirstDerivAnalytic(deriv, env, skCont, coords, species, iAt, orb, nNeighbourSK,&
+          & iNeighbours, iPair)
 
     case default
 

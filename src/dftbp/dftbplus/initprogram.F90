@@ -107,6 +107,9 @@ module dftbp_dftbplus_initprogram
   use dftbp_md_tempprofile, only : TempProfile_init, TTempProfile
   use dftbp_md_velocityverlet, only : init, TVelocityVerlet
   use dftbp_md_xlbomd, only : TXLBOMD, Xlbomd_init
+#:if WITH_SOCKETS
+  use dftbp_md_mxlbomd, only : TMxlBomd, TMxlBomd_init, mxlBomdDerivTypes
+#:endif
   use dftbp_mixer_factory, only : TMixerFactoryCmplx, TMixerFactoryReal
   use dftbp_mixer_mixer, only : TMixerCmplx, TMixerReal
   use dftbp_reks_reks, only : REKS_init, reksTypes, TReksCalc, TReksInp
@@ -595,6 +598,15 @@ module dftbp_dftbplus_initprogram
     !> Socket details
   #:if WITH_SOCKETS
     type(ipiSocketComm), allocatable :: socket
+
+    !> Use MaxwellLink socket communication in Born-Oppenheimer MD.
+    logical :: tMxlBomd = .false.
+
+    !> MaxwellLink BOMD coupling state.
+    type(TMxlBomd) :: mxlBomd
+
+    !> MaxwellLink-only differentiator for on-the-fly Born effective charges.
+    type(TNonSccDiff) :: mxlBomdNonSccDeriv
   #:endif
 
     !> File containing output geometry
@@ -1342,6 +1354,8 @@ contains
     real(dp) :: tmpSpinW(6)
     real(dp), allocatable :: eiTmp(:,:)
     logical :: isIoProc
+    logical :: tMxlBornResponse
+    real(dp) :: perturbDegenTol
 
   #:if WITH_MPI
     !! Number of k'-points
@@ -1981,6 +1995,24 @@ contains
     this%tAppendGeo = input%ctrl%tAppendGeo
     this%isSccConvRequired = input%ctrl%isSccConvRequired
     this%tMD = input%ctrl%tMD
+    tMxlBornResponse = .false.
+  #:if WITH_SOCKETS
+    this%tMxlBomd = allocated(input%ctrl%mxlBomdInput)
+    if (this%tMxlBomd) then
+      if (.not. this%tMD) then
+        call error("MaxwellLinkSocket for BOMD requires the VelocityVerlet driver")
+      end if
+      if (this%isXlbomd) then
+        call error("MaxwellLinkSocket for BOMD is not compatible with XLBOMD")
+      end if
+      if (allocated(input%ctrl%electricField) .or. allocated(input%ctrl%atomicExtPotential)) then
+        call error("MaxwellLinkSocket for BOMD cannot be combined with external fields or&
+            & potentials")
+      end if
+      tMxlBornResponse = input%ctrl%mxlBomdInput%derivType&
+          & == mxlBomdDerivTypes%bornChargesOnTheFly
+    end if
+  #:endif
     this%writeTrajectoryForces = input%ctrl%writeTrajectoryForces
     if (this%tMD) this%mdOutput = input%ctrl%mdOutput
     this%tDerivs = input%ctrl%tDerivs
@@ -2005,10 +2037,12 @@ contains
       ! parser should catch all of these:
       @:ASSERT(.not.this%eField%isTDEfield .or. this%tMD)
     end if
-
     this%tMulliken = input%ctrl%tMulliken .or. this%tPrintMulliken .or. this%isExtField .or.&
         & this%tFixEf .or. this%tSpinSharedEf .or. this%isHybridXc .or. this%isMdftb .or.&
         & this%electronicSolver%iSolver == electronicSolverTypes%GF
+    #:if WITH_SOCKETS
+    this%tMulliken = this%tMulliken .or. this%tMxlBomd
+    #:endif
     this%tAtomicEnergy = input%ctrl%tAtomicEnergy
     this%tPrintEigVecs = input%ctrl%tPrintEigVecs
     this%tPrintEigVecsTxt = input%ctrl%tPrintEigVecsTxt
@@ -2497,17 +2531,41 @@ contains
     this%doPerturbation = allocated(input%ctrl%perturbInp)
     this%doPerturbEachGeom = this%tDerivs .and. this%doPerturbation ! needs work
 
-    if (this%doPerturbation .or. this%doPerturbEachGeom) then
+    if (this%doPerturbation .or. this%doPerturbEachGeom .or. tMxlBornResponse) then
 
-      this%perturbSccTol = input%ctrl%perturbInp%perturbSccTol
-      this%maxPerturbIter = input%ctrl%perturbInp%maxPerturbIter
-      this%isPerturbConvRequired = input%ctrl%perturbInp%isPerturbConvRequired
+      if (this%doPerturbation) then
+        this%perturbSccTol = input%ctrl%perturbInp%perturbSccTol
+        this%maxPerturbIter = input%ctrl%perturbInp%maxPerturbIter
+        this%isPerturbConvRequired = input%ctrl%perturbInp%isPerturbConvRequired
+        perturbDegenTol = input%ctrl%perturbInp%tolDegenDFTBPT
+      #:if WITH_SOCKETS
+      else
+        this%perturbSccTol = input%ctrl%mxlBomdInput%perturbSccTol
+        this%maxPerturbIter = input%ctrl%mxlBomdInput%maxPerturbIter
+        this%isPerturbConvRequired = .true.
+        perturbDegenTol = input%ctrl%mxlBomdInput%perturbDegenTol
+      #:endif
+      end if
 
       allocate(this%response)
-      call TResponse_init(this%response, responseSolverTypes%spectralSum, this%tFixEf,&
-          & input%ctrl%perturbInp%tolDegenDFTBPT, input%ctrl%perturbInp%etaFreq)
+      if (this%doPerturbation) then
+        if (allocated(input%ctrl%perturbInp%etaFreq)) then
+          call TResponse_init(this%response, responseSolverTypes%spectralSum, this%tFixEf,&
+              & perturbDegenTol, input%ctrl%perturbInp%etaFreq)
+        else
+          call TResponse_init(this%response, responseSolverTypes%spectralSum, this%tFixEf,&
+              & perturbDegenTol)
+        end if
+      else
+        call TResponse_init(this%response, responseSolverTypes%spectralSum, this%tFixEf,&
+            & perturbDegenTol)
+      end if
 
-      this%isEResp = allocated(input%ctrl%perturbInp%dynEFreq)
+      if (this%doPerturbation) then
+        this%isEResp = allocated(input%ctrl%perturbInp%dynEFreq)
+      else
+        this%isEResp = .false.
+      end if
       if (this%isEResp) then
         call move_alloc(input%ctrl%perturbInp%dynEFreq, this%dynRespEFreq)
         if (this%isHybridXc .and. any(this%dynRespEFreq /= 0.0_dp)) then
@@ -2515,7 +2573,11 @@ contains
         end if
       end if
 
-      this%isKernelResp = allocated(input%ctrl%perturbInp%dynKernelFreq)
+      if (this%doPerturbation) then
+        this%isKernelResp = allocated(input%ctrl%perturbInp%dynKernelFreq)
+      else
+        this%isKernelResp = .false.
+      end if
       if (this%isKernelResp) then
         call move_alloc(input%ctrl%perturbInp%dynKernelFreq, this%dynKernelFreq)
         if (this%isHybridXc .and. any(this%dynKernelFreq /= 0.0_dp)) then
@@ -2527,8 +2589,16 @@ contains
         end if
       end if
 
-      this%isAtomCoordPerturb = input%ctrl%perturbInp%isAtomCoordPerturb
-      if (this%isAtomCoordPerturb) then
+      if (this%doPerturbation) then
+        this%isAtomCoordPerturb = input%ctrl%perturbInp%isAtomCoordPerturb
+      else
+        this%isAtomCoordPerturb = .false.
+      end if
+      if (tMxlBornResponse .and. withMpi) then
+        call error("MaxwellLinkSocket BornChargesOnTheFly does not yet support MPI-enabled&
+            & DFTB+ builds")
+      end if
+      if (this%isAtomCoordPerturb .or. tMxlBornResponse) then
         if (withMpi) then
           call error("Coordinate derivative perturbations do not yet work with MPI enabled DFTB+")
         end if
@@ -2773,6 +2843,19 @@ contains
       allocate(this%pMDIntegrator)
       call init(this%pMDIntegrator, pVelocityVerlet)
     end if
+
+  #:if WITH_SOCKETS
+    if (this%tMxlBomd) then
+      if (this%tBarostat) then
+        call error("MaxwellLinkSocket for BOMD does not currently support barostats")
+      end if
+      if (input%ctrl%thermostatInp%thermostatType /= thermostatTypes%dummy) then
+        call warning("MaxwellLinkSocket for BOMD with thermostats breaks conservative&
+            & Maxwell-molecule energy exchange")
+      end if
+      call TMxlBomd_init(this%mxlBomd, input%ctrl%mxlBomdInput, this%nAtom)
+    end if
+  #:endif
 
     call this%initPlumed(env, input%ctrl%tPlumed, this%tMD, this%plumedCalc)
 
@@ -4110,6 +4193,13 @@ contains
         call NonSccDiff_init(this%nonSccDeriv, diffTypes%richardson)
       end select
     end if
+
+  #:if WITH_SOCKETS
+    if (tMxlBornResponse) then
+      ! MaxwellLink on-the-fly Born charges use the analytic H0/S derivative channel.
+      call NonSccDiff_init(this%mxlBomdNonSccDeriv, diffTypes%analytic)
+    end if
+  #:endif
 
     ! Electron dynamics stuff
     if (this%isElecDyn) then

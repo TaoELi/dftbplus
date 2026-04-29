@@ -1781,7 +1781,8 @@ contains
       & tFixEf, spinW, thirdOrd, DftbU, iEqBlockDftbu, onsMEs, iEqBlockOnSite, hybridXc,&
       & nNeighbourLC, chrgMixerReal, isBandWritten, taggedWriter, isAutotestWritten,&
       & autoTestTagFile, isTagResultsWritten, taggedResultsFile, tWriteDetailedOut, fdDetailedOut,&
-      & kPoint, kWeight, iCellVec, cellVec, tPeriodic, isHelical, tMulliken, errStatus)
+      & kPoint, kWeight, iCellVec, cellVec, tPeriodic, isHelical, tMulliken, errStatus,&
+      & bornChargesOut, tWriteResponseOutput)
 
     !> Instance
     class(TResponse), intent(in) :: this
@@ -1965,6 +1966,12 @@ contains
     !> Status of routine
     type(TStatus), intent(out) :: errStatus
 
+    !> Born effective charges, if requested by caller.
+    real(dp), allocatable, intent(out), optional :: bornChargesOut(:,:,:)
+
+    !> Whether human-readable perturbation output should be written.
+    logical, intent(in), optional :: tWriteResponseOutput
+
     integer :: iS, iK, iKS, iAt, iNeigh, iCart, iSCC, iLev, iSh, iSp, jAt, jAtf, iOrb, jCart
 
     integer :: nSpin, nKpts, nOrbs, nIndepHam
@@ -2041,6 +2048,7 @@ contains
     real(dp), allocatable :: bornCharges(:,:,:)
 
     character(lc) :: tmpStr
+    logical :: tDoOutput
 
   #:if WITH_SCALAPACK
     ! need distributed matrix descriptors
@@ -2055,6 +2063,11 @@ contains
     call blocks%init(env%blacs%orbitalGrid, desc, "c")
 
   #:endif
+
+    tDoOutput = .true.
+    if (present(tWriteResponseOutput)) then
+      tDoOutput = tWriteResponseOutput
+    end if
 
     call init_perturbation(parallelKS, this%tolDegen, nOrbs, nKpts, nSpin, nIndepHam, maxFill,&
         & filling, ham, nFilled, nEmpty, dHam, dRho, idHam, idRho, degenTransform, hybridXc,&
@@ -2201,8 +2214,10 @@ contains
       ! perturbation direction
       lpCart: do iCart = 1, 3
 
-        write(stdOut,"(A,A,A,I0)")'Calculating derivative for displacement along ', &
-            & trim(direction(iCart)),' for atom ', iAt
+        if (tDoOutput) then
+          write(stdOut,"(A,A,A,I0)")'Calculating derivative for displacement along ', &
+              & trim(direction(iCart)),' for atom ', iAt
+        end if
 
         if (tSccCalc) then
           sOmega(:,:,:) = 0.0_dp
@@ -2257,7 +2272,9 @@ contains
             dRhoOut(:) = 0.0_dp
           end if
 
-          write(stdOut,"(1X,A,T12,A)")'SCC Iter','Error'
+          if (tDoOutput) then
+            write(stdOut,"(1X,A,T12,A)")'SCC Iter','Error'
+          end if
         end if
 
         iSCCIter = 1
@@ -2437,7 +2454,7 @@ contains
             end if
             sccErrorQ = maxval(abs(dqDiffRed))
 
-            if (maxSccIter > 1) then
+            if (tDoOutput .and. maxSccIter > 1) then
               write(stdOut,"(1X,I0,T10,E20.12)")iSCCIter, sccErrorQ
             end if
             tConverged = (sccErrorQ < sccTol)
@@ -2530,18 +2547,20 @@ contains
     call mpifx_allreduceip(env%mpi%globalComm, dEi, MPI_SUM)
   #:endif
 
-    write(stdOut, *)'dEi/d (eV / AA)'
-    write(stdOut,"(T16,A,T32,A,T48,A)")direction
-    do iS = 1, nSpin
-      do iAt = 1, nAtom
-        write(stdOut, "(1X,A,I0)")'dEi/d At.', iAt
-        do iOrb = 1, size(dEi,dim=1)
-          write(stdOut, "(3F16.8)") dEi(iOrb, 1, iS, :, iAt) * AA__Bohr
+    if (tDoOutput) then
+      write(stdOut, *)'dEi/d (eV / AA)'
+      write(stdOut,"(T16,A,T32,A,T48,A)")direction
+      do iS = 1, nSpin
+        do iAt = 1, nAtom
+          write(stdOut, "(1X,A,I0)")'dEi/d At.', iAt
+          do iOrb = 1, size(dEi,dim=1)
+            write(stdOut, "(3F16.8)") dEi(iOrb, 1, iS, :, iAt) * AA__Bohr
+          end do
         end do
       end do
-    end do
+    end if
 
-    if (isBandWritten) then
+    if (isBandWritten .and. tDoOutput) then
       do iAt = 1, nAtom
         do iCart = 1, 3
           write(tmpStr, "(A,1X,I0,1X,A,1X)")"Atom", iAt, "d"//direction(iCart)
@@ -2573,7 +2592,8 @@ contains
         write(fdDetailedOut, *)
       end if
 
-      if (tWriteDetailedOut .or. isTagResultsWritten) then
+      if (tWriteDetailedOut .or. isTagResultsWritten .or. present(bornChargesOut)&
+          & .or. tDoOutput) then
 
         allocate(bornCharges(3, 3, nAtom))
         do iAt = 1, nAtom
@@ -2588,8 +2608,20 @@ contains
         end do
       end if
 
-      call writeBorn(fdDetailedOut, bornCharges)
-      call writeBorn(stdOut, bornCharges)
+      if (present(bornChargesOut)) then
+        if (allocated(bornChargesOut)) then
+          deallocate(bornChargesOut)
+        end if
+        allocate(bornChargesOut(3, 3, nAtom))
+        bornChargesOut(:,:,:) = bornCharges(:,:,:)
+      end if
+
+      if (tDoOutput) then
+        if (tWriteDetailedOut) then
+          call writeBorn(fdDetailedOut, bornCharges)
+        end if
+        call writeBorn(stdOut, bornCharges)
+      end if
 
       if (isAutotestWritten) then
         open(newunit=fdResults, file=autoTestTagFile, position="append")

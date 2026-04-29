@@ -14,12 +14,13 @@
 !> species. At the moment, it handles only Slater-Koster data tabulated on an equidistant grid.
 module dftbp_dftb_slakocont
   use dftbp_common_accuracy, only : dp
-  use dftbp_dftb_slakoeqgrid, only : getCutoff, getNIntegrals, getSKIntegrals, TSlakoEqGrid
+  use dftbp_dftb_slakoeqgrid, only : getCutoff, getNIntegrals, getSKIntegrals,&
+      & getSKIntegralDerivs, TSlakoEqGrid
   implicit none
 
   private
   public :: TSlakoCont, init
-  public :: addTable, getMIntegrals, getCutoff, getSKIntegrals
+  public :: addTable, getMIntegrals, getCutoff, getSKIntegrals, getSKIntegralDerivs
 
   !> A specific Slater-Koster table implementation.
   type TSlaKo_
@@ -68,6 +69,11 @@ module dftbp_dftb_slakocont
   interface getSKIntegrals
     module procedure SlakoCont_getSKIntegrals
   end interface getSKIntegrals
+
+  !> Returns the Slater-Koster integrals and radial derivatives for a given distance.
+  interface getSKIntegralDerivs
+    module procedure SlakoCont_getSKIntegralDerivs
+  end interface getSKIntegralDerivs
 
 contains
 
@@ -174,5 +180,32 @@ contains
     call getSKIntegrals(this%slakos(sp2, sp1)%pSlakoEqGrid, sk, dist)
 
   end subroutine SlakoCont_getSKIntegrals
+
+
+  !> Returns the Slater-Koster integrals and radial derivatives for a given distance.
+  subroutine SlakoCont_getSKIntegralDerivs(this, sk, dSkDr, dist, sp1, sp2)
+
+    !> SlakoCont instance.
+    type(TSlakoCont), intent(in) :: this
+
+    !> Contains the integrals on exit.
+    real(dp), intent(out) :: sk(:)
+
+    !> Contains radial derivatives of the integrals on exit.
+    real(dp), intent(out) :: dSkDr(:)
+
+    !> Distance of the two atoms.
+    real(dp), intent(in) :: dist
+
+    !> Index of the first interacting species.
+    integer, intent(in) :: sp1
+
+    !> Index of the second interacting species.
+    integer, intent(in) :: sp2
+
+    @:ASSERT(this%tInit .and. this%tDataOK)
+    call getSKIntegralDerivs(this%slakos(sp2, sp1)%pSlakoEqGrid, sk, dSkDr, dist)
+
+  end subroutine SlakoCont_getSKIntegralDerivs
 
 end module dftbp_dftb_slakocont

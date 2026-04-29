@@ -46,6 +46,7 @@ module dftbp_dftbplus_inputdata
   use dftbp_type_wrappedintr, only : TWrappedInt1
 #:if WITH_SOCKETS
   use dftbp_io_ipisocket, only : IpiSocketCommInp
+  use dftbp_md_mxlbomd, only : TMxlBomdInput
 #:endif
 #:if WITH_TRANSPORT
   use dftbp_transport_negfvars, only : TNEGFGreenDensInfo, TNEGFTunDos
@@ -548,6 +549,9 @@ module dftbp_dftbplus_inputdata
   #:if WITH_SOCKETS
     !> Socket communication
     type(ipiSocketCommInp), allocatable :: socketInput
+
+    !> MaxwellLink socket communication for Born-Oppenheimer molecular dynamics.
+    type(TMxlBomdInput), allocatable :: mxlBomdInput
   #:endif
 
     type(TParallelOpts), allocatable :: parallelOpts

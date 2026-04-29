@@ -1,6 +1,7 @@
 set(curdir ${CMAKE_CURRENT_SOURCE_DIR})
 
 set(sources-fpp
+  ${curdir}/bornanalytic.F90
   ${curdir}/fermihelper.F90
   ${curdir}/linearresponse.F90
   ${curdir}/numderivs2.F90

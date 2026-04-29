@@ -14,4 +14,9 @@ set(sources-fpp
   ${curdir}/velocityverlet.F90
   ${curdir}/xlbomd.F90)
 
+if(WITH_SOCKETS)
+  list(APPEND sources-fpp
+    ${curdir}/mxlbomd.F90)
+endif()
+
 set(ALL-SOURCES-FPP ${ALL-SOURCES-FPP} ${sources-fpp} PARENT_SCOPE)
