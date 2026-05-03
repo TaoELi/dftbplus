@@ -10,4 +10,9 @@ set(sources-fpp
   ${curdir}/transcharges.F90
   ${curdir}/timeprop.F90)
 
+if(WITH_SOCKETS)
+  list(APPEND sources-fpp
+    ${curdir}/mxlrtdynamics.F90)
+endif()
+
 set(ALL-SOURCES-FPP ${ALL-SOURCES-FPP} ${sources-fpp} PARENT_SCOPE)

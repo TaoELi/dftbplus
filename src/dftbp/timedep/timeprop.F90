@@ -53,9 +53,7 @@ module dftbp_timedep_timeprop
   use dftbp_extlibs_tblite, only : TTBLite
   use dftbp_io_message, only : warning
 #:if WITH_SOCKETS
-  use dftbp_io_mxlcommon, only : buildMxlExtraJson, checkMxlInit, makeMxlSocketCommInput,&
-      & TMxlSocketInput
-  use dftbp_io_mxlsocket, only : MxlSocketComm, MxlSocketComm_init, MxlSocketCommInp
+  use dftbp_io_mxlcommon, only : TMxlSocketInput
 #:endif
   use dftbp_io_taggedoutput, only : tagLabels, TTaggedWriter
   use dftbp_math_blasroutines, only : gemm, her2k
@@ -99,6 +97,9 @@ module dftbp_timedep_timeprop
   private
   public :: runDynamics, TElecDynamics_init
   public :: initializeDynamics, finalizeDynamics, doTdStep
+#:if WITH_SOCKETS
+  public :: runOneMxlTdStep, getMxlDipole
+#:endif
   public :: TElecDynamicsInp, TElecDynamics
   public :: pertTypes, envTypes, tdSpinTypes
 
@@ -728,6 +729,54 @@ module dftbp_timedep_timeprop
 
   !> Prefix for dump files for pump-probe
   character(*), parameter :: pumpFilesDir = 'pump_frames'
+
+#:if WITH_SOCKETS
+  interface
+    module subroutine runMxlSocketDynamics(this, boundaryCond, coord, orb, neighbourList,&
+        & nNeighbourSK, symNeighbourList, nNeighbourCamSym, iSquare, iSparseStart, img2CentCell,&
+        & skHamCont, skOverCont, ints, env, coordAll, q0, referenceN0, spinW, tDualSpinOrbit,&
+        & xi, thirdOrd, dftbU, onSiteElements, refExtPot, solvation, eFieldScaling, hybridXc,&
+        & repulsive, iAtInCentralRegion, tFixEf, Ef, electronicSolver, qDepExtPot, loopTime,&
+        & errStatus)
+      type(TElecDynamics), intent(inout), target :: this
+      type(TBoundaryConds), intent(in) :: boundaryCond
+      real(dp), allocatable, intent(inout) :: coord(:,:)
+      type(TOrbitals), intent(in) :: orb
+      type(TNeighbourList), intent(inout) :: neighbourList
+      integer, intent(inout) :: nNeighbourSK(:)
+      type(TAuxNeighbourList), intent(inout), allocatable :: symNeighbourList
+      integer, intent(inout), allocatable :: nNeighbourCamSym(:)
+      integer, intent(in) :: iSquare(:)
+      integer, allocatable, intent(inout) :: iSparseStart(:,:)
+      integer, allocatable, intent(inout) :: img2CentCell(:)
+      type(TSlakoCont), intent(in) :: skHamCont
+      type(TSlakoCont), intent(in) :: skOverCont
+      type(TIntegral), intent(inout) :: ints
+      type(TEnvironment), intent(inout) :: env
+      real(dp), allocatable, intent(inout) :: coordAll(:,:)
+      real(dp), intent(inout) :: q0(:,:,:)
+      real(dp), intent(in) :: referenceN0(:,:)
+      real(dp), allocatable, intent(in) :: spinW(:,:,:)
+      logical, intent(in) :: tDualSpinOrbit
+      real(dp), allocatable, intent(in) :: xi(:,:)
+      type(TThirdOrder), intent(inout), allocatable :: thirdOrd
+      type(TDftbU), intent(in), allocatable :: dftbU
+      real(dp), intent(in), allocatable :: onSiteElements(:,:,:,:)
+      type(TRefExtPot) :: refExtPot
+      class(TSolvation), allocatable, intent(inout) :: solvation
+      class(TScaleExtEField), intent(in) :: eFieldScaling
+      class(THybridXcFunc), allocatable, intent(inout) :: hybridXc
+      class(TRepulsive), allocatable, intent(inout) :: repulsive
+      integer, intent(in) :: iAtInCentralRegion(:)
+      logical, intent(in) :: tFixEf
+      real(dp), intent(inout) :: Ef(:)
+      type(TElectronicSolver), intent(inout) :: electronicSolver
+      type(TQDepExtPotProxy), intent(inout), allocatable :: qDepExtPot
+      type(TTimer), intent(inout) :: loopTime
+      type(TStatus), intent(inout) :: errStatus
+    end subroutine runMxlSocketDynamics
+  end interface
+#:endif
 
 
 contains
@@ -1388,17 +1437,6 @@ contains
     type(TTimer) :: loopTime
     integer :: iStep
     real(dp) :: timeElec
-#:if WITH_SOCKETS
-    type(MxlSocketComm) :: mxlSocket
-    type(MxlSocketCommInp) :: mxlInput
-    character(lc) :: mxlExtra, mxlMessage
-    logical :: mxlHaveResult, mxlReceivedInit, mxlStop
-    real(dp) :: mxlDipoleCurrent(3), mxlDipoleEnd(3), mxlDipoleInitial(3)
-    real(dp) :: mxlDipoleStart(3)
-    real(dp) :: mxlEnergy, mxlEnergyEnd, mxlEnergyStart, mxlField(3), mxlInitDt
-    integer :: mxlReceivedMoleculeId
-    real(dp) :: mxlSource(3), mxlTime
-#:endif
 
     call env%globalTimer%startTimer(globalTimers%elecDynInit)
 
@@ -1422,137 +1460,13 @@ contains
 
 #:if WITH_SOCKETS
     if (this%tMxlSocket) then
-
-      call makeMxlSocketCommInput(this%mxlSocketInput, mxlInput)
-    #:if WITH_MPI
-      if (env%mpi%tGlobalLead) then
-    #:endif
-      call MxlSocketComm_init(mxlSocket, mxlInput)
-    #:if WITH_MPI
-      end if
-    #:endif
-
-      mxlHaveResult = .false.
-      mxlDipoleInitial(:) = 0.0_dp
-      if (this%mxlSocketInput%resetDipole) then
-        call getMxlDipole(this, mxlDipoleInitial)
-      end if
-
-      do iStep = 1, this%nSteps
-
-      #:if WITH_MPI
-        if (env%mpi%tGlobalLead) then
-      #:endif
-        call mxlSocket%receiveField(mxlHaveResult, mxlField, mxlStop, mxlReceivedInit)
-        if (mxlReceivedInit) then
-          mxlInitDt = mxlSocket%getInitDt()
-          mxlReceivedMoleculeId = mxlSocket%getMoleculeId()
-        else
-          mxlInitDt = -1.0_dp
-          mxlReceivedMoleculeId = -1
-        end if
-      #:if WITH_MPI
-        else
-          mxlField(:) = 0.0_dp
-          mxlStop = .false.
-          mxlReceivedInit = .false.
-          mxlInitDt = -1.0_dp
-          mxlReceivedMoleculeId = -1
-        end if
-        call mpifx_bcast(env%mpi%globalComm, mxlField)
-        call mpifx_bcast(env%mpi%globalComm, mxlStop)
-        call mpifx_bcast(env%mpi%globalComm, mxlReceivedInit)
-        call mpifx_bcast(env%mpi%globalComm, mxlInitDt)
-        call mpifx_bcast(env%mpi%globalComm, mxlReceivedMoleculeId)
-      #:endif
-        if (mxlReceivedInit) then
-          call checkMxlInit(mxlInitDt, mxlReceivedMoleculeId, this%dt,&
-              & this%mxlSocketInput%moleculeId, "ElectronDynamics", mxlMessage)
-          if (len_trim(mxlMessage) > 0) then
-            @:RAISE_ERROR(errStatus, -1, trim(mxlMessage))
-          end if
-        end if
-        if (mxlStop) then
-          exit
-        end if
-
-        this%presentField(:) = eFieldScaling%scaledExtEField(mxlField)
-        if (this%tLaser) then
-          this%presentField(:) = this%presentField(:) + this%tdFunction(:, iStep)
-        end if
-        this%tdFieldIsSet = .true.
-
-        call getMxlDipole(this, mxlDipoleStart)
-        mxlDipoleStart(:) = mxlDipoleStart(:) - mxlDipoleInitial(:)
-
-        call updateH(this, this%H1, ints, this%ham0, this%speciesAll, this%qq, q0, coord,&
-            & orb, this%potential, neighbourList, nNeighbourSK, iSquare, iSparseStart,&
-            & img2CentCell, iStep, this%chargePerShell, spinW, env, tDualSpinOrbit, xi,&
-            & thirdOrd, this%qBlock, dftbU, onSiteElements, refExtPot, this%deltaRho,&
-            & this%HSqrCplxCam, this%Ssqr, solvation, hybridXc, this%dispersion, this%rho,&
-            & errStatus)
-        @:PROPAGATE_ERROR(errStatus)
-
-        call doTdStep(this, boundaryCond, iStep, coord, orb, neighbourList, nNeighbourSK,&
-            & symNeighbourList, nNeighbourCamSym, iSquare, iSparseStart, img2CentCell, skHamCont,&
-            & skOverCont, ints, env, coordAll, q0, referenceN0, spinW, tDualSpinOrbit, xi,&
-            & thirdOrd, dftbU, onSiteElements, refExtPot, solvation, eFieldScaling, hybridXc,&
-            & repulsive, iAtInCentralRegion, tFixEf, Ef, electronicSolver, qDepExtPot, errStatus)
-        @:PROPAGATE_ERROR(errStatus)
-
-        mxlEnergyStart = this%energy%Etotal
-        call getTDEnergy(this, env, this%energy, this%rhoPrim, this%rho, neighbourList,&
-            & nNeighbourSK, orb, iSquare, iSparseStart, img2CentCell, this%ham0, this%qq, q0,&
-            & this%potential, this%chargePerShell, this%energyKin, tDualSpinOrbit, thirdOrd,&
-            & solvation, hybridXc, qDepExtPot, this%qBlock, dftbU, xi, iAtInCentralRegion,&
-            & tFixEf, Ef, onSiteElements, errStatus)
-        @:PROPAGATE_ERROR(errStatus)
-        mxlEnergyEnd = this%energy%Etotal
-
-        call getMxlDipole(this, mxlDipoleEnd)
-        mxlDipoleEnd(:) = mxlDipoleEnd(:) - mxlDipoleInitial(:)
-        mxlTime = this%time
-        mxlEnergy = 0.5_dp * (mxlEnergyStart + mxlEnergyEnd)
-        mxlDipoleCurrent(:) = 0.5_dp * (mxlDipoleStart(:) + mxlDipoleEnd(:))
-        mxlSource(:) = (mxlDipoleEnd(:) - mxlDipoleStart(:)) / this%dt
-
-        call buildMxlExtraJson(mxlTime, mxlEnergy, this%energyKin, mxlDipoleCurrent,&
-            & mxlDipoleCurrent, mxlExtra)
-
-        mxlHaveResult = .true.
-      #:if WITH_MPI
-        if (env%mpi%tGlobalLead) then
-      #:endif
-        call mxlSocket%sendSource(mxlEnergy, mxlSource, trim(mxlExtra), mxlStop)
-      #:if WITH_MPI
-        else
-          mxlStop = .false.
-        end if
-        call mpifx_bcast(env%mpi%globalComm, mxlStop)
-      #:endif
-        mxlHaveResult = .false.
-        this%tdFieldIsSet = .false.
-        if (mxlStop) then
-          exit
-        end if
-
-        if (mod(iStep, max(this%nSteps / 10, 1)) == 0) then
-          call loopTime%stop()
-          timeElec  = loopTime%getWallClockTime()
-          write(stdOut, "(A,2x,I6,2(2x,A,F10.6))") 'Step ', iStep, 'elapsed loop time: ',&
-              & timeElec, 'average time per loop ', timeElec / (iStep + 1)
-        end if
-
-      end do
-
-    #:if WITH_MPI
-      if (env%mpi%tGlobalLead) then
-    #:endif
-      call mxlSocket%shutdown()
-    #:if WITH_MPI
-      end if
-    #:endif
-
+      call runMxlSocketDynamics(this, boundaryCond, coord, orb, neighbourList, nNeighbourSK,&
+          & symNeighbourList, nNeighbourCamSym, iSquare, iSparseStart, img2CentCell, skHamCont,&
+          & skOverCont, ints, env, coordAll, q0, referenceN0, spinW, tDualSpinOrbit, xi,&
+          & thirdOrd, dftbU, onSiteElements, refExtPot, solvation, eFieldScaling, hybridXc,&
+          & repulsive, iAtInCentralRegion, tFixEf, Ef, electronicSolver, qDepExtPot, loopTime,&
+          & errStatus)
+      @:PROPAGATE_ERROR(errStatus)
     else
 #:endif
 
@@ -1753,7 +1667,7 @@ contains
     end if
 
     ! Add time dependent field if necessary
-    if (this%tLaser .or. this%tMxlSocket) then
+    if (this%tLaser .or. this%tdFieldThroughAPI) then
       call setPresentField(this, iStep, errStatus)
       @:PROPAGATE_ERROR(errStatus)
       do iAtom = 1, this%nExcitedAtom
@@ -2433,7 +2347,7 @@ contains
 
     TS = 0.0_dp
     call calcEnergies(env, this%sccCalc, this%tblite, qq, q0, chargePerShell, this%multipole,&
-        & mdftb, this%speciesAll, this%tLaser .or. this%tMxlSocket, .false., dftbU,&
+        & mdftb, this%speciesAll, this%tLaser .or. this%tdFieldThroughAPI, .false., dftbU,&
         & tDualSpinOrbit, rhoPrim, ham0, orb, neighbourList, nNeighbourSK, img2CentCell,&
         & iSparseStart, 0.0_dp, 0.0_dp, TS, potential, energy, thirdOrd, solvation, hybridXc,&
         & reks, qDepExtPot, qBlock,&
@@ -4190,7 +4104,7 @@ contains
     #:endif
     end if
 
-    if (this%tLaser .or. this%tMxlSocket) then
+    if (this%tLaser .or. this%tdFieldThroughAPI) then
       call setPresentField(this, iStep, errStatus)
       @:PROPAGATE_ERROR(errStatus)
       do iDir = 1, 3
@@ -4948,6 +4862,181 @@ contains
 
   end subroutine initializeDynamics
 
+
+#:if WITH_SOCKETS
+  !> Run one TD step with an externally injected electric field.
+  subroutine runOneMxlTdStep(this, boundaryCond, iStep, coord, orb, neighbourList, nNeighbourSK,&
+      & symNeighbourList, nNeighbourCamSym, iSquare, iSparseStart, img2CentCell, skHamCont,&
+      & skOverCont, ints, env, coordAll, q0, referenceN0, spinW, tDualSpinOrbit, xi, thirdOrd,&
+      & dftbU, onSiteElements, refExtPot, solvation, eFieldScaling, hybridXc, repulsive,&
+      & iAtInCentralRegion, tFixEf, Ef, electronicSolver, qDepExtPot, mxlField,&
+      & mxlDipoleInitial, mxlDipoleStart, mxlDipoleEnd, mxlEnergyStart, mxlEnergyEnd, errStatus)
+
+    !> ElecDynamics instance
+    type(TElecDynamics), intent(inout), target :: this
+
+    !> Boundary conditions on the calculation
+    type(TBoundaryConds), intent(in) :: boundaryCond
+
+    !> Current step of the propagation
+    integer, intent(in) :: iStep
+
+    !> Atomic coordinates
+    real(dp), allocatable, intent(inout) :: coord(:,:)
+
+    !> Atomic orbital information
+    type(TOrbitals), intent(in) :: orb
+
+    !> List of neighbours for each atom
+    type(TNeighbourList), intent(inout) :: neighbourList
+
+    !> Number of neighbours for each of the atoms
+    integer, intent(inout) :: nNeighbourSK(:)
+
+    !> List of neighbouring atoms (symmetric version)
+    type(TAuxNeighbourList), intent(inout), allocatable :: symNeighbourList
+
+    !> Symmetric neighbour list version of nNeighbourCam
+    integer, intent(inout), allocatable :: nNeighbourCamSym(:)
+
+    !> Index array for start of atomic block in dense matrices
+    integer, intent(in) :: iSquare(:)
+
+    !> Index array for location of atomic blocks in large sparse arrays
+    integer, allocatable, intent(inout) :: iSparseStart(:,:)
+
+    !> Image atoms to their equivalent in the central cell
+    integer, allocatable, intent(inout) :: img2CentCell(:)
+
+    !> Raw H^0 hamiltonian data
+    type(TSlakoCont), intent(in) :: skHamCont
+
+    !> Raw overlap data
+    type(TSlakoCont), intent(in) :: skOverCont
+
+    !> Integral container
+    type(TIntegral), intent(inout) :: ints
+
+    !> Environment settings
+    type(TEnvironment), intent(inout) :: env
+
+    !> All atomic coordinates
+    real(dp), allocatable, intent(inout) :: coordAll(:,:)
+
+    !> Reference atomic occupations
+    real(dp), intent(inout) :: q0(:,:,:)
+
+    !> Reference charges from the Slater-Koster file
+    real(dp), intent(in) :: referenceN0(:,:)
+
+    !> Spin constants
+    real(dp), allocatable, intent(in) :: spinW(:,:,:)
+
+    !> Is dual spin orbit being used (block potentials)
+    logical, intent(in) :: tDualSpinOrbit
+
+    !> Spin orbit constants if required
+    real(dp), allocatable, intent(in) :: xi(:,:)
+
+    !> 3rd order settings
+    type(TThirdOrder), intent(inout), allocatable :: thirdOrd
+
+    !> DFTB+U functional (if used)
+    type(TDftbU), intent(in), allocatable :: dftbU
+
+    !> Corrections terms for on-site elements
+    real(dp), intent(in), allocatable :: onSiteElements(:,:,:,:)
+
+    !> Reference external potential (usual provided via API)
+    type(TRefExtPot) :: refExtPot
+
+    !> Solvation model
+    class(TSolvation), allocatable, intent(inout) :: solvation
+
+    !> Any dielectric environment scaling
+    class(TScaleExtEField), intent(in) :: eFieldScaling
+
+    !> Range separation contributions
+    class(THybridXcFunc), allocatable, intent(inout) :: hybridXc
+
+    !> Repulsive information
+    class(TRepulsive), allocatable, intent(inout) :: repulsive
+
+    !> Atoms over which to sum the total energies
+    integer, intent(in) :: iAtInCentralRegion(:)
+
+    !> Whether fixed Fermi level(s) should be used. (No charge conservation!)
+    logical, intent(in) :: tFixEf
+
+    !> If tFixEf is .true. contains reservoir chemical potential.
+    real(dp), intent(inout) :: Ef(:)
+
+    !> Electronic solver information
+    type(TElectronicSolver), intent(inout) :: electronicSolver
+
+    !> Proxy for querying Q-dependant external potentials
+    type(TQDepExtPotProxy), intent(inout), allocatable :: qDepExtPot
+
+    !> Electric field in atomic units before dielectric scaling.
+    real(dp), intent(in) :: mxlField(3)
+
+    !> Dipole offset for reset-dipole mode.
+    real(dp), intent(in) :: mxlDipoleInitial(3)
+
+    !> Offset-corrected dipole at the start of the step.
+    real(dp), intent(out) :: mxlDipoleStart(3)
+
+    !> Offset-corrected dipole at the end of the step.
+    real(dp), intent(out) :: mxlDipoleEnd(3)
+
+    !> Total energy before the post-step TD energy refresh.
+    real(dp), intent(out) :: mxlEnergyStart
+
+    !> Total energy after the post-step TD energy refresh.
+    real(dp), intent(out) :: mxlEnergyEnd
+
+    !> Error status
+    type(TStatus), intent(inout) :: errStatus
+
+    this%presentField(:) = eFieldScaling%scaledExtEField(mxlField)
+    if (this%tLaser) then
+      this%presentField(:) = this%presentField(:) + this%tdFunction(:, iStep)
+    end if
+    this%tdFieldIsSet = .true.
+
+    call getMxlDipole(this, mxlDipoleStart)
+    mxlDipoleStart(:) = mxlDipoleStart(:) - mxlDipoleInitial(:)
+
+    call updateH(this, this%H1, ints, this%ham0, this%speciesAll, this%qq, q0, coord, orb,&
+        & this%potential, neighbourList, nNeighbourSK, iSquare, iSparseStart, img2CentCell,&
+        & iStep, this%chargePerShell, spinW, env, tDualSpinOrbit, xi, thirdOrd, this%qBlock,&
+        & dftbU, onSiteElements, refExtPot, this%deltaRho, this%HSqrCplxCam, this%Ssqr,&
+        & solvation, hybridXc, this%dispersion, this%rho, errStatus)
+    @:PROPAGATE_ERROR(errStatus)
+
+    call doTdStep(this, boundaryCond, iStep, coord, orb, neighbourList, nNeighbourSK,&
+        & symNeighbourList, nNeighbourCamSym, iSquare, iSparseStart, img2CentCell, skHamCont,&
+        & skOverCont, ints, env, coordAll, q0, referenceN0, spinW, tDualSpinOrbit, xi, thirdOrd,&
+        & dftbU, onSiteElements, refExtPot, solvation, eFieldScaling, hybridXc, repulsive,&
+        & iAtInCentralRegion, tFixEf, Ef, electronicSolver, qDepExtPot, errStatus)
+    @:PROPAGATE_ERROR(errStatus)
+
+    mxlEnergyStart = this%energy%Etotal
+    call getTDEnergy(this, env, this%energy, this%rhoPrim, this%rho, neighbourList, nNeighbourSK,&
+        & orb, iSquare, iSparseStart, img2CentCell, this%ham0, this%qq, q0, this%potential,&
+        & this%chargePerShell, this%energyKin, tDualSpinOrbit, thirdOrd, solvation, hybridXc,&
+        & qDepExtPot, this%qBlock, dftbU, xi, iAtInCentralRegion, tFixEf, Ef, onSiteElements,&
+        & errStatus)
+    @:PROPAGATE_ERROR(errStatus)
+    mxlEnergyEnd = this%energy%Etotal
+
+    call getMxlDipole(this, mxlDipoleEnd)
+    mxlDipoleEnd(:) = mxlDipoleEnd(:) - mxlDipoleInitial(:)
+
+  end subroutine runOneMxlTdStep
+
+
+#:endif
 
   !> Do one TD step, propagating electrons and nuclei (if IonDynamics is enabled)
   subroutine doTdStep(this, boundaryCond, iStep, coord, orb, neighbourList, nNeighbourSK,&
