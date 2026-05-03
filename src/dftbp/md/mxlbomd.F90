@@ -16,6 +16,8 @@ module dftbp_md_mxlbomd
   use dftbp_common_accuracy, only : dp, lc
   use dftbp_common_environment, only : TEnvironment
   use dftbp_io_message, only : error
+  use dftbp_io_mxlcommon, only : buildMxlExtraJson, checkMxlInit, makeMxlSocketCommInput,&
+      & TMxlSocketInput
   use dftbp_io_mxlsocket, only : MxlSocketComm, MxlSocketComm_init, MxlSocketCommInp
 #:if WITH_MPI
   use dftbp_extlibs_mpifx, only : mpifx_bcast
@@ -51,20 +53,8 @@ module dftbp_md_mxlbomd
   !> Input data for MaxwellLink-coupled velocity-Verlet BOMD.
   type :: TMxlBomdInput
 
-    !> Host name for TCP, or socket path for UNIX sockets.
-    character(lc) :: host = 'localhost'
-
-    !> TCP port. Values below 1 select UNIX sockets.
-    integer :: port = 31415
-
-    !> MaxwellLink communication verbosity.
-    integer :: verbosity = 0
-
-    !> Optional molecule id expected from MaxwellLink. Negative values disable checking.
-    integer :: moleculeId = -1
-
-    !> Whether to subtract the initial dipole in diagnostics.
-    logical :: resetDipole = .false.
+    !> Shared MaxwellLink socket settings.
+    type(TMxlSocketInput) :: socket
 
     !> Approximation used for dmu/dR.
     integer :: derivType = mxlBomdDerivTypes%mullikenCharges
@@ -236,6 +226,7 @@ contains
     logical, intent(out) :: tStop
 
     type(MxlSocketCommInp) :: socketInput
+    character(lc) :: msg
     logical :: tReceivedInit
     real(dp) :: initDt
     integer :: receivedMoleculeId
@@ -248,9 +239,7 @@ contains
     if (env%mpi%tGlobalLead) then
   #:endif
       if (.not. this%tConnected) then
-        socketInput%host = trim(this%input%host)
-        socketInput%port = this%input%port
-        socketInput%verbosity = this%input%verbosity
+        call makeMxlSocketCommInput(this%input%socket, socketInput)
         call MxlSocketComm_init(this%socket, socketInput)
         this%tConnected = .true.
       end if
@@ -279,12 +268,10 @@ contains
   #:endif
 
     if (tReceivedInit) then
-      if (initDt > 0.0_dp .and. abs(initDt - deltaT) > 1.0e-10_dp * max(1.0_dp, abs(deltaT))) then
-        call error("MaxwellLink INIT dt_au does not match VelocityVerlet TimeStep")
-      end if
-      if (this%input%moleculeId >= 0 .and. receivedMoleculeId /= this%input%moleculeId) then
-        call error("MaxwellLink INIT molecule id does not match VelocityVerlet&
-            & MaxwellLinkSocket MoleculeId")
+      call checkMxlInit(initDt, receivedMoleculeId, deltaT, this%input%socket%moleculeId,&
+          & "VelocityVerlet", msg)
+      if (len_trim(msg) > 0) then
+        call error(trim(msg))
       end if
     end if
 
@@ -512,13 +499,13 @@ contains
     !> Midpoint dipole estimate.
     real(dp), intent(out) :: dipoleMiddle(3)
 
-    if (this%input%resetDipole .and. .not. this%tInitialDipoleSet) then
+    if (this%input%socket%resetDipole .and. .not. this%tInitialDipoleSet) then
       this%initialDipole(:) = dipole(:)
       this%tInitialDipoleSet = .true.
     end if
 
     dipoleCurrent(:) = dipole(:)
-    if (this%input%resetDipole) then
+    if (this%input%socket%resetDipole) then
       dipoleCurrent(:) = dipoleCurrent(:) - this%initialDipole(:)
     end if
     dipoleMiddle(:) = dipoleCurrent(:) + 0.5_dp * deltaT * source(:)
@@ -550,19 +537,7 @@ contains
     !> JSON metadata.
     character(*), intent(out) :: extraJson
 
-    write(extraJson, '(A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,&
-        & A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A)')&
-        & '{"time_au":', time,&
-        & ',"mux_au":', dipoleMiddle(1),&
-        & ',"muy_au":', dipoleMiddle(2),&
-        & ',"muz_au":', dipoleMiddle(3),&
-        & ',"mux_m_au":', dipole(1),&
-        & ',"muy_m_au":', dipole(2),&
-        & ',"muz_m_au":', dipole(3),&
-        & ',"energy_au":', energy,&
-        & ',"energy_kin_au":', energyKin,&
-        & ',"energy_pot_au":', energy - energyKin,&
-        & '}'
+    call buildMxlExtraJson(time, energy, energyKin, dipoleMiddle, dipole, extraJson)
 
   end subroutine buildExtraJson
 

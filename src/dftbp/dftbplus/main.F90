@@ -66,6 +66,10 @@ module dftbp_dftbplus_main
   use dftbp_dftbplus_initprogram, only : overrideContactCharges
 #:endif
   use dftbp_dftbplus_inputdata, only : TNEGFInfo
+#:if WITH_SOCKETS
+  use dftbp_dftbplus_mxlbomddriver, only : applyMxlBomdFieldDerivs,&
+      & getMxlBomdSoluteDipole, receiveMxlBomdField, sendMxlBomdSource
+#:endif
   use dftbp_dftbplus_mainio, only : openOutputFile, printBlankLine, printElecConstrHeader,&
       & printElecConstrInfo, printEnergies, printForceNorm, printGeostepInfo,&
       & printLatticeForceNorm, printMaxForce, printMaxLatticeForce, printMdInfo,&
@@ -99,7 +103,7 @@ module dftbp_dftbplus_main
   use dftbp_math_matrixops, only : adjointLowerTriangle
   use dftbp_math_simplealgebra, only : derivDeterminant33, determinant33, invert33, removeTrace
   use dftbp_md_mdcommon, only : evalKE, evalKT, TMdCommon
-  use dftbp_md_mdintegrator, only : next, rescale, state, TMdIntegrator
+  use dftbp_md_mdintegrator, only : next, rescale, TMdIntegrator
   use dftbp_md_tempprofile, only : TTempProfile
   use dftbp_md_xlbomd, only : TXLBOMD
   use dftbp_mixer_mixer, only : TMixerCmplx, TMixerReal
@@ -204,12 +208,7 @@ contains
     type(TStatus) :: errStatus
     real(dp), pointer :: pDynMatrix(:,:), pDipDerivMatrix(:,:), pPolDerivMatrix(:,:,:)
   #:if WITH_SOCKETS
-    real(dp) :: mxlField(3), mxlSource(3), mxlSoluteDipole(3), mxlDipole(3)
-    real(dp) :: mxlSoluteDipoleNext(3), mxlDipoleMiddle(3)
-    real(dp) :: mxlEnergyKin, mxlEnergyMerminKin
-    real(dp), allocatable :: mxlVeloHalf(:,:)
-    character(4 * lc) :: mxlExtraJson
-    logical :: tMxlStop
+    real(dp) :: mxlSoluteDipole(3), mxlSoluteDipoleNext(3)
   #:endif
 
     call initGeoOptParameters(this%tCoordOpt, this%nGeoSteps, tGeomEnd, tCoordStep, tStopDriver,&
@@ -232,12 +231,10 @@ contains
 
     #:if WITH_SOCKETS
       if (this%tMxlBomd) then
-        call this%mxlBomd%receiveField(env, this%deltaT, mxlField, tStopDriver)
+        call receiveMxlBomdField(this, env, tStopDriver)
         if (tStopDriver) then
           exit geoOpt
         end if
-        mxlField(:) = this%eFieldScaling%scaledExtEField(mxlField)
-        call this%mxlBomd%setField(mxlField)
       end if
     #:endif
 
@@ -277,13 +274,10 @@ contains
 
     #:if WITH_SOCKETS
       if (this%tMxlBomd) then
-        if (this%mxlBomd%needsBornUpdate(iGeoStep)) then
-          call updateMxlBomdBornCharges(this, env, errStatus)
-          if (errStatus%hasError()) then
-            call error(errStatus%message)
-          end if
+        call applyMxlBomdFieldDerivs(this, env, iGeoStep, errStatus)
+        if (errStatus%hasError()) then
+          call error(errStatus%message)
         end if
-        call this%mxlBomd%addFieldDerivs(this%qOutput, this%q0, this%derivs)
       end if
     #:endif
 
@@ -368,10 +362,7 @@ contains
 
     #:if WITH_SOCKETS
       if (this%tMxlBomd) then
-        call this%mxlBomd%getDipole(this%qOutput, this%q0, this%coord0,&
-            & this%iAtInCentralRegion, this%dipoleMoment(:, this%deltaDftb%iFinal),&
-            & mxlSoluteDipole)
-        mxlSoluteDipole(:) = this%eFieldScaling%scaledSoluteDipole(mxlSoluteDipole)
+        call getMxlBomdSoluteDipole(this, mxlSoluteDipole)
       end if
     #:endif
 
@@ -385,8 +376,6 @@ contains
 
     #:if WITH_SOCKETS
       if (this%tMxlBomd) then
-        mxlEnergyMerminKin = this%dftbEnergy(this%deltaDftb%iFinal)%EMerminKin
-        mxlEnergyKin = this%dftbEnergy(this%deltaDftb%iFinal)%Ekin
         if (this%mxlBomd%usesFiniteDifferenceSource()) then
           call getMxlBomdEndpointDipole(this, env, iGeoStep + 1, iLatGeoStep,&
               & mxlSoluteDipoleNext, errStatus)
@@ -394,22 +383,11 @@ contains
             call error(errStatus%message)
           end if
           mxlSoluteDipoleNext(:) = this%eFieldScaling%scaledSoluteDipole(mxlSoluteDipoleNext)
-          call this%mxlBomd%getFiniteDifferenceSource(this%deltaT, mxlSoluteDipole,&
-              & mxlSoluteDipoleNext, mxlSource)
+          call sendMxlBomdSource(this, env, iGeoStep, mxlSoluteDipole, tStopDriver,&
+              & mxlSoluteDipoleNext)
         else
-          allocate(mxlVeloHalf(3, this%nMovedAtom))
-          call state(this%pMdIntegrator, velocities=mxlVeloHalf)
-          call this%mxlBomd%getSource(this%indMovedAtom, mxlVeloHalf, mxlSource)
-          deallocate(mxlVeloHalf)
-          mxlSource(:) = this%eFieldScaling%scaledSoluteDipole(mxlSource)
+          call sendMxlBomdSource(this, env, iGeoStep, mxlSoluteDipole, tStopDriver)
         end if
-        call this%mxlBomd%getDipoles(this%deltaT,&
-            & mxlSoluteDipole, mxlSource, mxlDipole, mxlDipoleMiddle)
-        call this%mxlBomd%buildExtraJson((real(iGeoStep, dp) + 0.5_dp) * this%deltaT,&
-            & mxlEnergyMerminKin, mxlEnergyKin, mxlDipole, mxlDipoleMiddle, mxlExtraJson)
-        call this%mxlBomd%sendSource(env, mxlEnergyMerminKin, mxlSource,&
-            & trim(mxlExtraJson), tMxlStop)
-        tStopDriver = tStopDriver .or. tMxlStop
       end if
     #:endif
 
@@ -8359,42 +8337,6 @@ contains
 
   end subroutine getMxlBomdEndpointDipole
 
-
-  !> Recompute Born effective charges for MaxwellLink-coupled BOMD.
-  subroutine updateMxlBomdBornCharges(this, env, errStatus)
-
-    !> Global variables.
-    type(TDftbPlusMain), intent(inout) :: this
-
-    !> Environment settings.
-    type(TEnvironment), intent(inout) :: env
-
-    !> Error status.
-    type(TStatus), intent(out) :: errStatus
-
-    real(dp), allocatable :: bornCharges(:,:,:)
-    integer :: maxPerturbIter
-    real(dp) :: perturbSccTol
-
-    call this%mxlBomd%getPerturbSettings(maxPerturbIter, perturbSccTol)
-    call this%response%dxAtom(env, this%parallelKS, this%filling, this%eigen, this%eigVecsReal,&
-        & this%eigvecsCplx, this%rhoPrim, this%potential, this%qOutput, this%q0,&
-        & this%ints%hamiltonian, this%ints%overlap, this%skHamCont, this%skOverCont,&
-        & this%mxlBomdNonSccDeriv, this%orb, this%nAtom, this%species, this%speciesName,&
-        & this%neighbourList, this%nNeighbourSK, this%denseDesc, this%iSparseStart,&
-        & this%img2CentCell, this%coord, this%scc, maxPerturbIter, perturbSccTol,&
-        & this%nMixElements, this%nIneqOrb, this%iEqOrbitals, this%tempElec, this%Ef,&
-        & this%tFixEf, this%spinW, this%thirdOrd, this%dftbU, this%iEqBlockDftbu,&
-        & this%onSiteElements, this%iEqBlockOnSite, this%hybridXc, this%nNeighbourCam,&
-        & this%chrgMixerReal, .false., this%taggedWriter, .false., autotestTag, .false.,&
-        & resultsTag, .false., this%fdDetailedOut%unit, this%kPoint, this%kWeight,&
-        & this%iCellVec, this%cellVec, this%tPeriodic, this%tHelical, this%tMulliken, errStatus,&
-        & bornChargesOut=bornCharges, tWriteResponseOutput=.false.)
-    @:PROPAGATE_ERROR(errStatus)
-
-    call this%mxlBomd%updateBornChargesFromResponse(bornCharges)
-
-  end subroutine updateMxlBomdBornCharges
 
 #:endif
 

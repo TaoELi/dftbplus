@@ -45,9 +45,6 @@ module dftbp_io_mxlsocket
     !> Used to log messages.
     type(LogWriter) :: logger
 
-    !> Verbosity level.
-    integer :: verbosity
-
     !> Socket number.
     integer :: socket
 
@@ -86,12 +83,6 @@ module dftbp_io_mxlsocket
   end type MxlSocketComm
 
 
-  !> Constructor for MxlSocketComm.
-  interface MxlSocketComm
-    module procedure construct
-  end interface MxlSocketComm
-
-
   !> Length of MaxwellLink/i-PI message headers.
   integer, parameter :: MXL_MSGLEN = 12
 
@@ -115,7 +106,6 @@ contains
       call error("MaxwellLink socket host/path was not set")
     end if
 
-    this%verbosity = input%verbosity
     this%logger = LogWriter(input%verbosity)
 
     tUnix = input%port < 1
@@ -135,20 +125,6 @@ contains
     call this%logger%write('mxlSocketCreate: ...Done', 1)
 
   end subroutine MxlSocketComm_init
-
-
-  !> Construct MxlSocketComm instance.
-  function construct(input) result(this)
-
-    !> Input data.
-    type(MxlSocketCommInp), intent(in) :: input
-
-    !> Instance.
-    type(MxlSocketComm) :: this
-
-    call MxlSocketComm_init(this, input)
-
-  end function construct
 
 
   !> Receive field data from MaxwellLink.

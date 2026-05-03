@@ -45,6 +45,9 @@ module dftbp_dftbplus_parser
   use dftbp_dftbplus_input_geoopt, only : readGeoOptInput
   use dftbp_dftbplus_inputconversion, only : transformpdosregioninfo
   use dftbp_dftbplus_inputdata, only : TBlacsOpts, TControl, THybridXcInp, TInputData, TSlater
+  #:if WITH_SOCKETS
+  use dftbp_dftbplus_mxlparser, only : parseMaxwellLinkBomdInput, parseMaxwellLinkElecInput
+  #:endif
   use dftbp_dftbplus_oldcompat, only : convertOldHSD, minVersion, parserVersion, versionMaps
   use dftbp_dftbplus_specieslist, only : readSpeciesList
   use dftbp_elecsolvers_elecsolvers, only : electronicSolverTypes, providesEigenvalues
@@ -92,7 +95,6 @@ module dftbp_dftbplus_parser
 #:endif
 #:if WITH_SOCKETS
   use dftbp_io_ipisocket, only : IPI_PROTOCOLS
-  use dftbp_md_mxlbomd, only : mxlBomdDerivTypes
 #:endif
 #:if WITH_TRANSPORT
   use dftbp_transport_negfvars, only : ContactInfo, TElPh, TNEGFGreenDensInfo, TNEGFTunDos
@@ -440,7 +442,6 @@ contains
     type(string) :: buffer, buffer2, modifier
   #:if WITH_SOCKETS
     character(lc) :: sTmp
-    type(TListReal) :: mxlCharges
   #:endif
 
     ! Default range of atoms to move (may be adjusted if contacts present)
@@ -647,54 +648,7 @@ contains
       if (associated(child2)) then
       #:if WITH_SOCKETS
         allocate(ctrl%mxlBomdInput)
-        call parseMaxwellLinkSocketAddress(child2, ctrl%mxlBomdInput%host,&
-            & ctrl%mxlBomdInput%port, ctrl%mxlBomdInput%verbosity,&
-            & ctrl%mxlBomdInput%moleculeId, ctrl%mxlBomdInput%resetDipole)
-
-        call getChildValue(child2, "DipoleDerivative", value1, "MullikenCharges", child=child)
-        call getNodeName(value1, buffer)
-        select case (char(buffer))
-        case ("fixedcharges")
-          ctrl%mxlBomdInput%derivType = mxlBomdDerivTypes%fixedCharges
-          call init(mxlCharges)
-          call getChildValue(child2, "Charges", mxlCharges, child=child3)
-          if (len(mxlCharges) < 1) then
-            call detailedError(child3, "MaxwellLinkSocket Charges must not be empty")
-          end if
-          allocate(ctrl%mxlBomdInput%fixedCharges(len(mxlCharges)))
-          call asArray(mxlCharges, ctrl%mxlBomdInput%fixedCharges)
-          call destruct(mxlCharges)
-
-        case ("mullikencharges")
-          ctrl%mxlBomdInput%derivType = mxlBomdDerivTypes%mullikenCharges
-
-        case ("bornchargesfile")
-          call detailedError(child, "MaxwellLinkSocket DipoleDerivative = BornChargesFile has&
-              & been removed; use BornChargesOnTheFly")
-
-        case ("bornchargesonthefly")
-          ctrl%mxlBomdInput%derivType = mxlBomdDerivTypes%bornChargesOnTheFly
-          call getChildValue(child2, "BornUpdateEvery", ctrl%mxlBomdInput%bornUpdateEvery, 1,&
-              & child=child3)
-          if (ctrl%mxlBomdInput%bornUpdateEvery < 1) then
-            call detailedError(child3, "MaxwellLinkSocket BornUpdateEvery must be positive")
-          end if
-          call getChildValue(child2, "MaxPerturbIter", ctrl%mxlBomdInput%maxPerturbIter, 100)
-          call getChildValue(child2, "PerturbSccTol", ctrl%mxlBomdInput%perturbSccTol,&
-              & 1.0E-5_dp)
-          call getChildValue(child2, "PerturbDegenTol", ctrl%mxlBomdInput%perturbDegenTol,&
-              & 1.0E-9_dp, modifier=modifier, child=child3)
-          call convertUnitHsd(char(modifier), energyUnits, child3,&
-              & ctrl%mxlBomdInput%perturbDegenTol)
-          if (ctrl%mxlBomdInput%perturbDegenTol < epsilon(0.0_dp)) then
-            call detailedError(child3, "MaxwellLinkSocket PerturbDegenTol must be above machine&
-                & epsilon")
-          end if
-
-        case default
-          call detailedError(child, "Invalid MaxwellLinkSocket DipoleDerivative '"&
-              & // char(buffer) // "'")
-        end select
+        call parseMaxwellLinkBomdInput(child2, ctrl%mxlBomdInput)
 
       #:else
         call detailedError(child2, "Program had been compiled without socket support")
@@ -5850,75 +5804,6 @@ contains
   end subroutine readCustomisedHubbards
 
 
-#:if WITH_SOCKETS
-
-  !> Read MaxwellLink socket address and shared options.
-  subroutine parseMaxwellLinkSocketAddress(mxlNode, host, port, verbosity, moleculeId, resetDipole)
-
-    !> MaxwellLinkSocket node.
-    type(fnode), pointer, intent(in) :: mxlNode
-
-    !> Host name for TCP, or socket path for UNIX sockets.
-    character(lc), intent(out) :: host
-
-    !> TCP port, or 0 for UNIX sockets.
-    integer, intent(out) :: port
-
-    !> Communication verbosity.
-    integer, intent(out) :: verbosity
-
-    !> Expected molecule id. Negative values disable checking.
-    integer, intent(out) :: moleculeId
-
-    !> Whether to subtract the initial dipole in diagnostics.
-    logical, intent(out) :: resetDipole
-
-    type(fnode), pointer :: child, fileNode, hostNode
-    type(string) :: buffer, buffer2
-    character(lc) :: mxlFile
-
-    call getChild(mxlNode, "File", child=fileNode, requested=.false.)
-    call getChild(mxlNode, "Host", child=hostNode, requested=.false.)
-    if (associated(fileNode) .and. associated(hostNode)) then
-      call detailedError(mxlNode, "Either Host or File, but not both, must be set for&
-          & MaxwellLinkSocket")
-    end if
-
-    if (associated(fileNode)) then
-      call getChildValue(fileNode, "", buffer2)
-      mxlFile = unquote(char(buffer2))
-      if (len_trim(mxlFile) == 0) then
-        call detailedError(fileNode, "MaxwellLinkSocket File must not be empty")
-      end if
-      if (mxlFile(1:1) == "/") then
-        host = trim(mxlFile)
-      else
-        call getChildValue(mxlNode, "Prefix", buffer, "/tmp/socketmxl_")
-        host = trim(unquote(char(buffer))) // trim(mxlFile)
-      end if
-      port = 0
-    else
-      if (associated(hostNode)) then
-        call getChildValue(hostNode, "", buffer2)
-        host = unquote(char(buffer2))
-      else
-        host = "localhost"
-      end if
-      call getChildValue(mxlNode, "Port", port, 31415, child=child)
-      if (port <= 0) then
-        call detailedError(child, "Invalid MaxwellLinkSocket port number")
-      end if
-    end if
-
-    call getChildValue(mxlNode, "Verbosity", verbosity, 0)
-    call getChildValue(mxlNode, "MoleculeId", moleculeId, -1)
-    call getChildValue(mxlNode, "ResetDipole", resetDipole, .false.)
-
-  end subroutine parseMaxwellLinkSocketAddress
-
-#:endif
-
-
   !> Reads the electron dynamics block
   subroutine readElecDynamics(node, input, geom, masses)
 
@@ -5965,9 +5850,7 @@ contains
     call getChild(node, "MaxwellLinkSocket", child=mxlNode, requested=.false.)
     if (associated(mxlNode)) then
     #:if WITH_SOCKETS
-      input%tMxlSocket = .true.
-      call parseMaxwellLinkSocketAddress(mxlNode, input%mxlHost, input%mxlPort,&
-          & input%mxlVerbosity, input%mxlMoleculeId, input%mxlResetDipole)
+      call parseMaxwellLinkElecInput(mxlNode, input)
     #:else
       call detailedError(mxlNode, "Program had been compiled without socket support")
     #:endif

@@ -24,6 +24,12 @@ if(WITH_API)
   list(APPEND sources-fpp ${curdir}/mainapi.F90)
 endif()
 
+if(WITH_SOCKETS)
+  list(APPEND sources-fpp
+    ${curdir}/mxlbomddriver.F90
+    ${curdir}/mxlparser.F90)
+endif()
+
 add_subdirectory(input)
 
 set(ALL-SOURCES-FPP ${ALL-SOURCES-FPP} ${sources-fpp} PARENT_SCOPE)

@@ -53,6 +53,8 @@ module dftbp_timedep_timeprop
   use dftbp_extlibs_tblite, only : TTBLite
   use dftbp_io_message, only : warning
 #:if WITH_SOCKETS
+  use dftbp_io_mxlcommon, only : buildMxlExtraJson, checkMxlInit, makeMxlSocketCommInput,&
+      & TMxlSocketInput
   use dftbp_io_mxlsocket, only : MxlSocketComm, MxlSocketComm_init, MxlSocketCommInp
 #:endif
   use dftbp_io_taggedoutput, only : tagLabels, TTaggedWriter
@@ -232,20 +234,10 @@ module dftbp_timedep_timeprop
     !> If external electric fields are supplied by MaxwellLink over a socket
     logical :: tMxlSocket = .false.
 
-    !> Host name for MaxwellLink TCP sockets, or path for UNIX sockets
-    character(lc) :: mxlHost = 'localhost'
-
-    !> MaxwellLink TCP port. Values below 1 select UNIX sockets
-    integer :: mxlPort = 31415
-
-    !> MaxwellLink communication verbosity
-    integer :: mxlVerbosity = 0
-
-    !> Optional molecule id expected from MaxwellLink. Negative values disable checking
-    integer :: mxlMoleculeId = -1
-
-    !> Whether to subtract the initial dipole from the values reported to MaxwellLink
-    logical :: mxlResetDipole = .false.
+  #:if WITH_SOCKETS
+    !> Shared MaxwellLink socket settings.
+    type(TMxlSocketInput) :: mxlSocketInput
+  #:endif
 
   end type TElecDynamicsInp
 
@@ -464,20 +456,10 @@ module dftbp_timedep_timeprop
     !> If external electric fields are supplied by MaxwellLink over a socket
     logical :: tMxlSocket = .false.
 
-    !> Host name for MaxwellLink TCP sockets, or path for UNIX sockets
-    character(lc) :: mxlHost = 'localhost'
-
-    !> MaxwellLink TCP port. Values below 1 select UNIX sockets
-    integer :: mxlPort = 31415
-
-    !> MaxwellLink communication verbosity
-    integer :: mxlVerbosity = 0
-
-    !> Optional molecule id expected from MaxwellLink. Negative values disable checking
-    integer :: mxlMoleculeId = -1
-
-    !> Whether to subtract the initial dipole from the values reported to MaxwellLink
-    logical :: mxlResetDipole = .false.
+  #:if WITH_SOCKETS
+    !> Shared MaxwellLink socket settings.
+    type(TMxlSocketInput) :: mxlSocketInput
+  #:endif
 
     !> Whether dynamics outputs are printed or not for Ehrenfest or electron dynamics.
     logical :: tVerboseDyn = .true.
@@ -860,11 +842,9 @@ contains
     this%speciesName = speciesName
     this%tFillingsFromFile = inp%tFillingsFromFile
     this%tMxlSocket = inp%tMxlSocket
-    this%mxlHost = inp%mxlHost
-    this%mxlPort = inp%mxlPort
-    this%mxlVerbosity = inp%mxlVerbosity
-    this%mxlMoleculeId = inp%mxlMoleculeId
-    this%mxlResetDipole = inp%mxlResetDipole
+  #:if WITH_SOCKETS
+    this%mxlSocketInput = inp%mxlSocketInput
+  #:endif
     if (this%tMxlSocket) then
       this%tdFieldThroughAPI = .true.
       if (tPeriodic) then
@@ -1411,7 +1391,7 @@ contains
 #:if WITH_SOCKETS
     type(MxlSocketComm) :: mxlSocket
     type(MxlSocketCommInp) :: mxlInput
-    character(lc) :: mxlExtra
+    character(lc) :: mxlExtra, mxlMessage
     logical :: mxlHaveResult, mxlReceivedInit, mxlStop
     real(dp) :: mxlDipoleCurrent(3), mxlDipoleEnd(3), mxlDipoleInitial(3)
     real(dp) :: mxlDipoleStart(3)
@@ -1443,9 +1423,7 @@ contains
 #:if WITH_SOCKETS
     if (this%tMxlSocket) then
 
-      mxlInput%host = trim(this%mxlHost)
-      mxlInput%port = this%mxlPort
-      mxlInput%verbosity = this%mxlVerbosity
+      call makeMxlSocketCommInput(this%mxlSocketInput, mxlInput)
     #:if WITH_MPI
       if (env%mpi%tGlobalLead) then
     #:endif
@@ -1456,7 +1434,7 @@ contains
 
       mxlHaveResult = .false.
       mxlDipoleInitial(:) = 0.0_dp
-      if (this%mxlResetDipole) then
+      if (this%mxlSocketInput%resetDipole) then
         call getMxlDipole(this, mxlDipoleInitial)
       end if
 
@@ -1488,15 +1466,10 @@ contains
         call mpifx_bcast(env%mpi%globalComm, mxlReceivedMoleculeId)
       #:endif
         if (mxlReceivedInit) then
-          if (mxlInitDt > 0.0_dp .and.&
-              & abs(mxlInitDt - this%dt) > 1.0e-10_dp * max(1.0_dp, abs(this%dt))) then
-            @:RAISE_ERROR(errStatus, -1, "MaxwellLink INIT dt_au does not match&
-                & ElectronDynamics TimeStep")
-          end if
-          if (this%mxlMoleculeId >= 0 .and.&
-              & mxlReceivedMoleculeId /= this%mxlMoleculeId) then
-            @:RAISE_ERROR(errStatus, -1, "MaxwellLink INIT molecule id does not match&
-                & ElectronDynamics MaxwellLinkSocket MoleculeId")
+          call checkMxlInit(mxlInitDt, mxlReceivedMoleculeId, this%dt,&
+              & this%mxlSocketInput%moleculeId, "ElectronDynamics", mxlMessage)
+          if (len_trim(mxlMessage) > 0) then
+            @:RAISE_ERROR(errStatus, -1, trim(mxlMessage))
           end if
         end if
         if (mxlStop) then
@@ -4453,44 +4426,6 @@ contains
     end if
 
   end subroutine getMxlDipole
-
-
-  !> Build MaxwellLink JSON metadata returned with source data.
-  subroutine buildMxlExtraJson(time, energy, energyKin, dipole, dipoleMiddle, extraJson)
-
-    !> Elapsed simulation time in atomic units.
-    real(dp), intent(in) :: time
-
-    !> Total energy in Hartree.
-    real(dp), intent(in) :: energy
-
-    !> Nuclear kinetic energy in Hartree.
-    real(dp), intent(in) :: energyKin
-
-    !> Dipole reported to MaxwellLink.
-    real(dp), intent(in) :: dipole(3)
-
-    !> Midpoint dipole reported under the MaxwellLink midpoint-key convention.
-    real(dp), intent(in) :: dipoleMiddle(3)
-
-    !> JSON metadata.
-    character(*), intent(out) :: extraJson
-
-    write(extraJson, '(A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,&
-        & A,ES24.16,A,ES24.16,A,ES24.16,A,ES24.16,A)')&
-        & '{"time_au":', time,&
-        & ',"mux_au":', dipole(1),&
-        & ',"muy_au":', dipole(2),&
-        & ',"muz_au":', dipole(3),&
-        & ',"mux_m_au":', dipoleMiddle(1),&
-        & ',"muy_m_au":', dipoleMiddle(2),&
-        & ',"muz_m_au":', dipoleMiddle(3),&
-        & ',"energy_au":', energy,&
-        & ',"energy_kin_au":', energyKin,&
-        & ',"energy_pot_au":', energy - energyKin,&
-        & '}'
-
-  end subroutine buildMxlExtraJson
 
 
   !> Calculates bond populations and bond energies if requested
