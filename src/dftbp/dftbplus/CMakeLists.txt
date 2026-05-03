@@ -26,6 +26,7 @@ endif()
 
 if(WITH_SOCKETS)
   list(APPEND sources-fpp
+    ${curdir}/mxlbornanalytic.F90
     ${curdir}/mxlbomddriver.F90
     ${curdir}/mxlparser.F90)
 endif()

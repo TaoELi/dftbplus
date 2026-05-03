@@ -13,7 +13,9 @@ module dftbp_dftb_nonscc
   use dftbp_common_accuracy, only : dp
   use dftbp_common_environment, only : TEnvironment
   use dftbp_common_schedule, only : assembleChunks, distributeRangeInChunks
-  use dftbp_derivs_bornanalytic, only : getFirstDerivAnalytic
+  #:if WITH_SOCKETS
+  use dftbp_dftbplus_mxlbornanalytic, only : getFirstDerivAnalytic
+  #:endif
   use dftbp_dftb_sk, only : rotateH0
   use dftbp_dftb_slakocont, only : getMIntegrals, getSKIntegrals, TSlakoCont
   use dftbp_io_message, only : error
@@ -201,6 +203,11 @@ contains
     if (all([diffTypes%finiteDiff, diffTypes%richardson, diffTypes%analytic] /= diffType)) then
       call error("Invalid differentiator type in NonSccDiff_init")
     end if
+    #:if not WITH_SOCKETS
+    if (diffType == diffTypes%analytic) then
+      call error("Analytic non-SCC derivatives require WITH_SOCKETS")
+    end if
+    #:endif
     this%diffType = diffType
     if (present(deltaXDiff)) then
       this%deltaXDiff = deltaXDiff
@@ -243,7 +250,11 @@ contains
     case (diffTypes%richardson)
       call getFirstDerivRichardson(deriv, skCont, coords, species, atomI, atomJ, orb)
     case (diffTypes%analytic)
+      #:if WITH_SOCKETS
       call getFirstDerivAnalytic(deriv, skCont, coords, species, atomI, atomJ, orb)
+      #:else
+      call error("Analytic non-SCC derivatives require WITH_SOCKETS")
+      #:endif
     end select
 
   end subroutine getFirstDerivBlock
@@ -318,8 +329,12 @@ contains
 
     case (diffTypes%analytic)
 
+      #:if WITH_SOCKETS
       call getFirstDerivAnalytic(deriv, env, skCont, coords, species, iAt, orb, nNeighbourSK,&
           & iNeighbours, iPair)
+      #:else
+      call error("Analytic non-SCC derivatives require WITH_SOCKETS")
+      #:endif
 
     case default
 

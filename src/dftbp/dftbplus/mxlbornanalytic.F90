@@ -7,8 +7,10 @@
 
 #:include 'common.fypp'
 
+#:if WITH_SOCKETS
+
 !> Analytic Slater-Koster matrix derivatives for Born effective-charge response.
-module dftbp_derivs_bornanalytic
+module dftbp_dftbplus_mxlbornanalytic
   use dftbp_common_accuracy, only : dp
   use dftbp_common_environment, only : TEnvironment
   use dftbp_common_schedule, only : assembleChunks, distributeRangeInChunks
@@ -1394,4 +1396,6 @@ contains
 
   end subroutine ff
 
-end module dftbp_derivs_bornanalytic
+end module dftbp_dftbplus_mxlbornanalytic
+
+#:endif
